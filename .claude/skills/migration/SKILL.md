@@ -2,10 +2,13 @@
 name: migration
 description: Create a labelled migration ticket + matching migration AgDR — required by the migration gate.
 argument-hint: "[<project>]"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # /migration — Create a Migration Ticket + AgDR
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the
+migration ticket and AgDR. Lead with the outcome and keep required detail precise.
 
 Migrations are high-blast-radius: data loss, downtime, lock contention, cross-service coordination. ApexYard treats them as a distinct class of change from code — a migration PR needs:
 
@@ -30,7 +33,7 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 
 ```
 /migration                 # prompts for everything, creates ticket + AgDR in the current project
-/migration curios-dog      # explicitly target a registered project
+/migration sample-app      # explicitly target a registered project
 ```
 
 ## When to invoke
@@ -43,6 +46,11 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 - Generally: BEFORE the first `Write` on anything the migration-gate hook blocks
 
 ## Process
+
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
 
 ### 0. Write the active-issue-skill marker (REQUIRED — me2resh/apexyard#268)
 
@@ -86,6 +94,8 @@ If the project isn't registered, stop — file one via `/handover` first, or pas
 ### 2. Gather the migration facts (conversational)
 
 Ask each of the following. Each answer feeds both the issue body and the AgDR — the skill writes them into both so the user never retypes.
+Use `AskUserQuestion` for the fields with listed choices. For a choice field such as migration type, recommend the best supported value first. For a factual field such as "Rollback tested against" or "Estimated downtime", do not recommend a value the operator has not confirmed. Put the most conservative value first (for example `not tested`), and recommend another value only when the conversation already holds evidence for it.
+Use the listed values as a numbered prose fallback only when the harness lacks the tool.
 
 1. **One-line summary** — goes in the ticket title: `[Migration] <type>: <summary>`
 2. **Migration type** — `schema | data | sql | orm` (pick one; if it straddles, use the most invasive)

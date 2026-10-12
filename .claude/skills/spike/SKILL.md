@@ -2,10 +2,13 @@
 name: spike
 description: Create a hypothesis-driven, time-boxed spike ticket (Hypothesis/Budget/Kill Criteria/Disposition). Exempt from AgDR + coverage gates.
 argument-hint: "<short title of the spike>"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # /spike — Create a Spike Ticket
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the spike
+ticket and disposition record. Keep the hypothesis and kill criteria concise.
 
 Creates a structured GitHub Issue for a **spike** — a 1-3 day hypothesis-driven exploration whose goal is to answer a technical question with minimum investment, with the explicit understanding that the code will be discarded or substantially rewritten once the answer is clear.
 
@@ -32,6 +35,11 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 ```
 
 ## Process
+
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
 
 ### 0. Write the active-issue-skill marker (REQUIRED — me2resh/apexyard#268)
 
@@ -130,6 +138,9 @@ Under what specific conditions does the spike STOP early?
 Encourage at least two kill criteria — one "answered: yes" and one "answered: no / unworkable". Don't accept "we'll figure it out".
 
 **d) Disposition (required — PROMOTE or DISCARD)**
+
+Use `AskUserQuestion` for this choice. Recommend `DISCARD` first and describe both effects.
+Use the prompt below only when the harness lacks the tool.
 
 ```
 What happens when the spike closes — PROMOTE or DISCARD?

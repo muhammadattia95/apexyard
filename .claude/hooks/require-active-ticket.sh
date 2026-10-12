@@ -1,7 +1,7 @@
 #!/bin/bash
 # Blocks Edit/Write/MultiEdit on code paths when no active ticket is set.
-# Enforces the ticket-first rule mechanically instead of relying on prose
-# in CLAUDE.md, workflows/sdlc.md, or .claude/rules/workflow-gates.md.
+# This enforces the ticket-first rule instead of relying on prose in
+# CLAUDE.md, workflows/sdlc.md, or .claude/rules/workflow-gates.md.
 #
 # Active tickets are declared by the /start-ticket skill. The marker
 # layout is three-tier (apexyard#41 + #513):
@@ -34,12 +34,729 @@
 #   - anything under projects/*/docs/ (per-project apexyard docs)
 #
 # Everything else (source code, config, infra) requires a ticket marker.
+#
+# Out-of-governance exemption (apexyard#883): a write TARGET entirely
+# outside every governed tree (the ops fork AND every registered
+# workspace/<project> clone) AND not inside ANY git repository at all is
+# outside this gate's jurisdiction — home dotfiles (~/.zshrc), /etc-style
+# machine config, /tmp scratch files. See the "Out-of-governance
+# exemption" block below for the fail-closed resolution rules (symlinked
+# targets and unresolvable/ambiguous targets stay gated).
+#
+# ALL write targets are judged, not just the first (apexyard#886): a Bash
+# command can name more than one write target (`echo a > /tmp/x; echo b >
+# src/app.ts`, `tee /tmp/a src/b.ts`). The gate pipeline below is wrapped
+# in a function and invoked ONCE PER EXTRACTED TARGET (see the dispatch
+# section at the bottom); the command as a whole only passes if EVERY
+# target independently clears the gate. Judging only the first target
+# let a command that also names an out-of-governance target FIRST slip an
+# in-repo target past a gate that stopped looking after target #1.
 
+# _resolve_real_path — portable directory path canonicalisation.
+#
+# Why this matters (#883): without resolving symlinks first, a symlink
+# living under $HOME that POINTS INTO a governed tree (e.g.
+# ~/link-into-repo → the ops fork) would compare as "outside" the repo
+# under a naive string-prefix check, silently bypassing the gate.
+#
+# Sourced from the single shared definition at _lib-path-resolve.sh (PR
+# #1087 review, Rex finding #4) rather than defined inline — this used to
+# be a self-contained copy, which put THREE near-identical
+# implementations of the same algorithm in .claude/hooks/ across two
+# files, one of which had already silently diverged. See
+# _lib-path-resolve.sh's own header comment for the full rationale.
+# The helper leaves a symlink at the final component unchanged. Both
+# exemptions below also check target components for symlinks.
+_RATC_HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Stale-hook notice (#1449). Advisory: appended to the refusal below when
+# upstream's copy of this gate or a `_lib-*.sh` it sources has changed since
+# the fork's version, so a fork owner does not debug or report a hook that may
+# already be fixed. Degrades to silence if the helper is missing, exactly like
+# every other failure path inside it.
+if [ -f "$_RATC_HOOK_DIR/_lib-hook-drift.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$_RATC_HOOK_DIR/_lib-hook-drift.sh"
+fi
+_ratc_stale_hook_notice() {
+  command -v hook_drift_notice_for_gate >/dev/null 2>&1 || return 0
+  hook_drift_notice_for_gate "$_RATC_HOOK_DIR/require-active-ticket.sh" 2>/dev/null || true
+}
+
+if [ -f "$_RATC_HOOK_DIR/_lib-path-resolve.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$_RATC_HOOK_DIR/_lib-path-resolve.sh"
+else
+  # DELIBERATE DEGRADE, not an oversight (#1089 — closing #1087's LOW-2).
+  # _lib-path-resolve.sh is tracked right next to this file, so this branch
+  # only fires on genuine corruption (a partial checkout, a stray deletion) —
+  # it should never happen in a normal clone. Both the code review and the
+  # security review on PR #1087 independently verified that WITHOUT this
+  # else branch (i.e. _resolve_real_path simply undefined), every call site
+  # below still fails toward the SAFE outcome: an undefined-function call
+  # substitutes an empty string, `_og_real_target` stays empty, the
+  # `[ -n "$_og_real_target" ]` guard a few lines down is never satisfied,
+  # and the out-of-governance exemption block is skipped entirely — the
+  # target falls straight through to the ordinary ticket gate below
+  # (GATED, never silently exempted). See #883 for why an unresolved/empty
+  # target must never be treated as exempt.
+  #
+  # This is the deliberate asymmetry with bin/install-git-hooks.sh, which
+  # HARD-FAILS (exit 2) when ITS required lib is missing: that script's
+  # whole job is telling the operator "this clone IS protected," so a false
+  # positive there is actively harmful. This hook is a safety GATE — the
+  # safe direction for a gate that can't resolve a path is to keep gating,
+  # not to wave it through — so a hard failure here would be strictly worse
+  # than the silent degrade this else branch documents and pins.
+  #
+  # What this branch actually changes: nothing about the pass/fail outcome
+  # above (that was already correct) — only the diagnostic. Without a
+  # defined `_resolve_real_path`, bash prints a raw, unhelpful
+  # "command not found" to stderr on every call. Defining a stand-in that
+  # always echoes nothing (the same "unresolvable" contract the real
+  # function's own header comment describes) replaces that with a named,
+  # actionable message — printed once per hook invocation, not once per
+  # call site, so a single Bash command naming several targets doesn't
+  # spam the operator.
+  _resolve_real_path() {
+    if [ -z "${_RATC_PATH_RESOLVE_WARNED:-}" ]; then
+      echo "ApexYard: _lib-path-resolve.sh is missing next to require-active-ticket.sh — path resolution is degrading to fail-closed (gated), not exempt. This should not happen in a normal clone; see me2resh/apexyard#1089." >&2
+      _RATC_PATH_RESOLVE_WARNED=1
+    fi
+    return 0
+  }
+fi
+
+# Path exemptions (AgDR-0219 / #1531). Sourced after _lib-path-resolve.sh so
+# ticket_path_is_meta_exempt can reuse _resolve_real_path for /var vs
+# /private/var prefix compares.
+if [ -f "$_RATC_HOOK_DIR/_lib-ticket-path-exemptions.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$_RATC_HOOK_DIR/_lib-ticket-path-exemptions.sh"
+fi
+
+# ------------------------------------------------------------------------------
+# _ratc_quoted_origin_hint TOOL_NAME
+#
+# Echoes an explanatory note when every write sign the detector found in the
+# Bash command sits INSIDE a quoted argument. Echoes nothing otherwise. It
+# reads the command from $COMMAND.
+#
+# DIAGNOSIS ONLY (me2resh/apexyard#1356). This function never changes a
+# verdict. It runs after the gate has already decided to block, and it only
+# adds text to the message. AgDR-0113 forbids feeding quote-filtered text to a
+# gate's presence question, because a parser bug there fails OPEN across every
+# consumer at once. The gate's own presence check below still reads the raw
+# command. This function asks the same question of the MASKED command, but
+# only to choose a message. A bug here yields a worse message, never a
+# skipped gate. See `_lib-mask-quoted.sh` and AgDR-0171.
+# ------------------------------------------------------------------------------
+_ratc_quoted_origin_hint() {
+  local tool="${1-}"
+
+  [ "$tool" = "Bash" ] || return 0
+  [ -n "${COMMAND:-}" ] || return 0
+  [ -f "$_RATC_HOOK_DIR/_lib-mask-quoted.sh" ] || return 0
+  command -v bash_command_appears_to_write >/dev/null 2>&1 || return 0
+
+  # shellcheck source=/dev/null
+  . "$_RATC_HOOK_DIR/_lib-mask-quoted.sh"
+
+  local masked
+  masked=$(mask_quoted_metachars "$COMMAND" 2>/dev/null)
+
+  # An empty mask is never a legitimate result for a non-empty command. It
+  # means awk is missing, awk failed, or the command exceeded the kernel's
+  # single-environment-string limit (MAX_ARG_STRLEN, 128 KiB on Linux) so
+  # execve returned E2BIG. Without this guard, "" reads as "differs from
+  # COMMAND" and the note fires on a genuine write that holds no quote at
+  # all. Verified at 140 KB.
+  [ -n "$masked" ] || return 0
+
+  # No quoted metacharacter, or an uncertainty guard tripped. Say nothing.
+  [ "$masked" != "$COMMAND" ] || return 0
+
+  # Some write sign still sits outside quotes, so at least one target may be
+  # real. Say nothing. This is a presence check, not a target extraction. It
+  # costs far less. AgDR-0171 records the measured cost.
+  #
+  # DIAGNOSIS ONLY. Never copy this call into a verdict. A gate must ask this
+  # question of the RAW command (AgDR-0113 governance rule 2). Here the answer
+  # only chooses whether to print the note.
+  bash_command_appears_to_write "$masked" && return 0
+
+  # The note speaks about the quoted match only, not the whole command. The
+  # quoted text may still run as code through eval, sh -c, or awk. The
+  # command may also write in a way the detector does not see, such as touch
+  # or ln. The note offers one remedy only. Advice to reword a command would
+  # steer an agent toward a detector gap when the write is real.
+  #
+  # No surrounding blank lines here. The caller adds them, because command
+  # substitution strips trailing newlines from whatever this prints.
+  printf '%s' "NOTE: the detector found this match only inside quoted text. It matches raw
+command text and does not parse shell quoting (me2resh/apexyard#1356). If
+the quoted text is only data, this match is a false positive. If eval,
+sh -c, awk, or another program runs the quoted text, it may write a file.
+The detector does not see every kind of write. Declare a ticket to continue."
+}
+
+# A review scratch clone must live under a temporary directory. Check the
+# physical path so a symlinked temp directory cannot expand this boundary.
+_ratc_in_temp_dir() {
+  local target="$1" candidate root
+  for candidate in /tmp /var/tmp "${TMPDIR:-}"; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] || continue
+    root=$(cd "$candidate" 2>/dev/null && pwd -P) || continue
+    case "$target" in
+      "$root"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# An exemption must not trust a path that traverses a symlink. The shared
+# resolver follows directory links but can leave a final-component link
+# (including a dangling one) unchanged. Start below a physical temp root so
+# system aliases such as /tmp -> /private/tmp are not mistaken for target
+# links. Still inspect every component beneath that root, including the final
+# entry. Outside a temp root, inspect the whole path.
+_ratc_path_has_symlink_component() {
+  local path="$1" probe="$1" root="/" candidate physical
+  for candidate in /tmp /var/tmp "${TMPDIR:-}"; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] || continue
+    candidate="${candidate%/}"
+    [ -n "$candidate" ] || continue
+    physical=$(cd "$candidate" 2>/dev/null && pwd -P) || continue
+    case "$path" in
+      "$candidate"/*)
+        probe="$physical/${path#"$candidate"/}"
+        root="$physical"
+        break ;;
+      "$physical"/*)
+        root="$physical"
+        break ;;
+    esac
+  done
+  # A parent traversal could leave the selected root; keep it gated rather
+  # than skipping components on the other side of that traversal.
+  if [ "$root" != "/" ]; then
+    case "$probe" in */../*|*/..) return 0 ;; esac
+  fi
+  while [ -n "$probe" ] && [ "$probe" != "$root" ] && [ "$probe" != "/" ]; do
+    # A trailing slash hides a directory symlink from `test -L`.
+    case "$probe" in
+      */) probe="${probe%/}"; continue ;;
+    esac
+    [ -L "$probe" ] && return 0
+    probe="$(dirname "$probe")"
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# _ratc_evaluate_target FILE_PATH TOOL_NAME
+#
+# Runs the full ticket-gate pipeline for ONE candidate write target:
+# variable-target exemptions, REPO_ROOT/REL_PATH normalisation, path-prefix
+# exemptions, ops-root discovery, the out-of-governance exemption
+# (#883/#885), the bootstrap-skill exemption, and marker resolution
+# (tier 0 per-worktree / tier 1 per-project / tier 2 ops fallback).
+#
+# Returns 0 if this target is exempt OR a matching ticket marker is found.
+# Returns 2 (and prints a BLOCKED message to stderr) if this target
+# requires an active ticket that isn't set.
+#
+# #886: called ONCE PER EXTRACTED BASH WRITE TARGET by the dispatch section
+# below — not just the first. All local state (REPO_ROOT, OPS_ROOT,
+# PROJECT, the markers, ...) is scoped to this function so each call is
+# independent; nothing leaks between targets.
+# ------------------------------------------------------------------------------
+_ratc_evaluate_target() {
+  local FILE_PATH="$1"
+  local TOOL_NAME="$2"
+
+  # Variable target (e.g. `cat > "$VAR"`): the extractor returns the literal
+  # shell-variable token. Exempt a temp-dir var, and a BARE whole-target variable
+  # (`$CEO`, `${marker}` — unresolvable, in practice a .claude/ scratch path). A
+  # variable WITH a concatenated path tail (`$PWD/src/app.ts`, `$D/app.ts`,
+  # `$HOME/work/src/x.ts`) is NOT exempt — that path could be tracked source, and
+  # the old blanket `$*` exemption let such a write dodge the ticket gate (#582
+  # review: fail-open on a security gate). A var+tail target isn't bare and isn't
+  # absolute, so it falls through to the ticket gate below and blocks — which is
+  # the safe direction. (We deliberately do NOT expand $PWD/$HOME here: that adds
+  # nothing for blocking and tripped a /var↔/private/var symlink mismatch.)
+  case "$FILE_PATH" in
+    '$TMPDIR'/*|'${TMPDIR}'/*|'$TMP'/*|'${TMP}'/*) return 0 ;;  # temp dir → outside the repo
+  esac
+  # Bare whole-target variable only (no path/extension tail) → exempt.
+  if printf '%s' "$FILE_PATH" | grep -qE '^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$'; then
+    return 0
+  fi
+
+  if [ -z "$FILE_PATH" ] && [ "$TOOL_NAME" != "Bash" ]; then
+    return 0
+  fi
+
+  # Normalise to repo-relative path when possible.
+  #
+  # BUG #744 FIX: derive REPO_ROOT from the FILE_PATH's directory, NOT the
+  # hook's CWD. The harness can fire with any CWD (e.g. /tmp, the ops root,
+  # a totally unrelated directory). Using `git rev-parse --show-toplevel`
+  # from the hook process's CWD returns the WRONG root whenever the CWD
+  # differs from the file's actual git repo — which breaks the OPS_ROOT
+  # walk-up and causes the per-project marker to be missed, blocking edits
+  # even when /start-ticket set a valid marker (#744, #745).
+  #
+  # Resolution order:
+  #   1. FILE_PATH is set and absolute: run git in the file's nearest existing
+  #      ancestor directory.  Works for new files (dirname of a not-yet-created
+  #      path still points at the parent dir).
+  #   2. FILE_PATH is set but relative (Bash write-target extracted from the
+  #      command): relative paths are relative to the process CWD, so fall
+  #      back to the legacy CWD-based git rev-parse — same behaviour as before.
+  #   3. FILE_PATH is empty (Bash command, no extractable target): CWD-based
+  #      fallback as before.
+  # REPO_ROOT drives ops-root / marker resolution. For a LINKED worktree,
+  # AgDR-0141 still rewrites REPO_ROOT to the main-checkout root so the
+  # walk-up finds the real ops fork. Path exemptions below MUST NOT use
+  # that rewritten root — they match against the file's OWN toplevel via
+  # ticket_path_is_meta_exempt (AgDR-0219 / #1531).
+  local REPO_ROOT="" _fp_dir _wt_gd _wt_gcd _main_root
+  if [ -n "$FILE_PATH" ]; then
+    case "$FILE_PATH" in
+      /*)
+        # Absolute path — find the nearest existing ancestor directory.
+        # dirname works on non-existent files; the while loop handles the
+        # case where the new file's parent dir doesn't exist yet.
+        _fp_dir="$(dirname "$FILE_PATH")"
+        while [ -n "$_fp_dir" ] && [ "$_fp_dir" != "/" ] && [ ! -d "$_fp_dir" ]; do
+          _fp_dir="$(dirname "$_fp_dir")"
+        done
+        if [ -d "$_fp_dir" ]; then
+          REPO_ROOT=$(git -C "$_fp_dir" rev-parse --show-toplevel 2>/dev/null)
+          # When the file's repo is a LINKED git worktree the worktree dir
+          # inherits the main branch's files — including anchor files like
+          # onboarding.yaml / apexyard.projects.yaml.  The OPS_ROOT walk-up
+          # below would then stop at the worktree instead of the real ops
+          # fork.  Detect a linked worktree (absolute git-dir ≠ common-dir)
+          # and replace REPO_ROOT with the main-checkout root (dirname of
+          # the common-dir, i.e. parent of the main .git dir).  This keeps
+          # the walk-up anchored to the actual ops fork while leaving the
+          # later per-worktree branch detection (which re-reads git from
+          # _fdir) unaffected.
+          if [ -n "$REPO_ROOT" ]; then
+            _wt_gd=$(git -C "$_fp_dir" rev-parse --absolute-git-dir 2>/dev/null)
+            _wt_gcd=$(git -C "$_fp_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+            if [ -n "$_wt_gd" ] && [ -n "$_wt_gcd" ] && [ "$_wt_gd" != "$_wt_gcd" ]; then
+              _main_root=$(dirname "$_wt_gcd")
+              [ -d "$_main_root" ] && REPO_ROOT="$_main_root"
+            fi
+          fi
+        fi
+        ;;
+      *)
+        # Relative path (Bash write-target): resolve against CWD.
+        REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+        ;;
+    esac
+  fi
+  # Fallback: FILE_PATH empty (Bash command, no extractable target).
+  if [ -z "$REPO_ROOT" ]; then
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+  fi
+
+  # NOTE: the narrow "Bash absolute path outside REPO_ROOT" exemption that
+  # used to live here (#569) has been superseded by the out-of-governance
+  # exemption below (apexyard#883), which covers BOTH Bash and Edit/Write/
+  # MultiEdit, resolves symlinks before judging, and checks the actual
+  # governance boundaries (ops root + registered workspaces) rather than
+  # just "outside the nearest git repo". See that block for the full design.
+
+  # Exempt paths (AgDR-0219 / #1531).
+  #
+  # Match against the file's OWN worktree top via the shared helper — not
+  # against REPO_ROOT after the AgDR-0141 main-clone rewrite. Absolute
+  # */.claude/* and */docs/* arms apply only when the path was not stripped
+  # (out-of-repo / no git root), preserving projects/*/docs/ and bare
+  # absolute meta paths. See _lib-ticket-path-exemptions.sh.
+  #
+  # Skipped entirely when FILE_PATH is empty (Bash command writes to an
+  # unextractable target — e.g. `python -c '...write...'`). Those fall
+  # through to the ticket gate; the bootstrap-skill exemption below covers
+  # the legitimate use case (/setup writing to fork-root files via Bash).
+  if [ -n "$FILE_PATH" ] && command -v ticket_path_is_meta_exempt >/dev/null 2>&1; then
+    if ticket_path_is_meta_exempt "$FILE_PATH"; then
+      return 0
+    fi
+  elif [ -n "$FILE_PATH" ]; then
+    # Lib missing (partial checkout): fail closed — do not path-exempt.
+    :
+  fi
+
+  # Discover the ops root. Walk up from REPO_ROOT looking for either the
+  # v2 `.apexyard-fork` marker (split-portfolio v2 layout) OR the legacy
+  # v1 anchor (onboarding.yaml + apexyard.projects.yaml). Stop at /. If
+  # not found, OPS_ROOT stays empty and we treat the REPO_ROOT itself as
+  # the marker home (pre-#41 behaviour).
+  #
+  # Guard change (#744/#745): the lib-based resolver is always invoked when
+  # the lib is available — even when REPO_ROOT is empty. This matters for
+  # split-portfolio v2 where the workspace is a sibling repo with no git
+  # history: REPO_ROOT is empty (no git in the sibling dir) but the
+  # session-pin resolver in _lib-ops-root.sh can still locate the ops fork
+  # from the pin written at session-start, regardless of start dir.
+  local HOOK_DIR OPS_ROOT="" r parent _ratc_hook_root="" _ratc_cwd_root="" _ratc_session_root=""
+  HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "$HOOK_DIR/_lib-ops-root.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$HOOK_DIR/_lib-ops-root.sh"
+    # Pass REPO_ROOT as the walk-up start dir when available; the pin
+    # resolver ignores the start dir and uses the session pin directly.
+    OPS_ROOT=$(resolve_ops_root "${REPO_ROOT:-}")
+    # A cloned ops fork carries the same anchor files, so without a pin the
+    # target walk can identify the scratch clone as OPS_ROOT. For a review
+    # target in a temp repo, prefer the session's working directory only
+    # when it resolves to the fork that owns this hook. A missing or
+    # mismatched root cannot activate the reviewer exception below.
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ -n "$FILE_PATH" ] \
+       && [ -n "$REPO_ROOT" ] && _ratc_in_temp_dir "$REPO_ROOT"; then
+      _ratc_hook_root=$(resolve_ops_root_walk "$HOOK_DIR")
+      _ratc_cwd_root=$(resolve_ops_root_walk "$PWD")
+      if [ -n "$_ratc_hook_root" ] && [ "$_ratc_cwd_root" = "$_ratc_hook_root" ]; then
+        # Keep a valid session pin authoritative if it names another fork.
+        _ratc_session_root=$(resolve_ops_root "$PWD")
+        if [ "$_ratc_session_root" = "$_ratc_hook_root" ]; then
+          OPS_ROOT="$_ratc_hook_root"
+        fi
+      fi
+    fi
+  elif [ -n "$REPO_ROOT" ]; then
+    # Inline walk-up fallback when the lib is absent (e.g. minimal test
+    # sandboxes that only copy the core libs).
+    r="$REPO_ROOT"
+    while [ -n "$r" ] && [ "$r" != "/" ]; do
+      if [ -f "$r/.apexyard-fork" ]; then
+        OPS_ROOT="$r"
+        break
+      fi
+      if [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; then
+        OPS_ROOT="$r"
+        break
+      fi
+      parent=$(dirname "$r"); [ "$parent" = "$r" ] && break; r="$parent"
+    done
+  fi
+
+  local MARKER_HOME="${OPS_ROOT:-$REPO_ROOT}"
+  MARKER_HOME="${MARKER_HOME:-.}"
+
+  # Resolve the workspace dir for the per-project marker resolution below.
+  # Defaults to $OPS_ROOT/workspace; split-portfolio v2 adopters override
+  # via portfolio.workspace_dir to point at their private sibling repo.
+  local WORKSPACE_DIR="$OPS_ROOT/workspace" resolved_ws
+  if [ -n "$OPS_ROOT" ] && [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ] && [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$HOOK_DIR/_lib-read-config.sh"
+    # shellcheck source=/dev/null
+    . "$HOOK_DIR/_lib-portfolio-paths.sh"
+    resolved_ws=$(portfolio_workspace_dir 2>/dev/null)
+    if [ -n "$resolved_ws" ]; then
+      WORKSPACE_DIR="$resolved_ws"
+    fi
+  fi
+
+  # --- Out-of-governance exemption (apexyard#883) -------------------------
+  #
+  # A write TARGET that is outside every governed tree — the ops fork
+  # itself AND every registered workspace/<project> clone — AND not inside
+  # ANY git repository at all is outside this gate's jurisdiction. Applies
+  # to BOTH Bash-detected writes and Edit/Write/MultiEdit tool calls (the
+  # earlier #569 exemption was Bash-only, which left Edit-tool writes to
+  # e.g. ~/.zshrc gated with no legitimate way to satisfy the gate on forks
+  # with GitHub Issues disabled — the exact bug reported in #883).
+  #
+  # Fail-closed directions (deliberate):
+  #   - An unresolvable FILE_PATH (empty — a Bash target the extractor
+  #     couldn't identify) is NEVER exempted here; it falls through to the
+  #     ticket gate below, unchanged from before this change.
+  #   - Relative paths (a Bash write-target like `src/app.ts`) resolve
+  #     against the hook's CWD before judging.
+  #   - A symlink below a physical temp root (or anywhere in a non-temp
+  #     target path) keeps both exemptions closed, including dangling links.
+  #     The resolver alone does not follow a link at the final component.
+  #   - Being inside SOME git repository that is neither the ops fork nor a
+  #     registered workspace project does NOT exempt the write on its own —
+  #     the ops-root/workspace boundaries are checked EXPLICITLY (not
+  #     merely inferred from "is this a git repo"), because a
+  #     split-portfolio workspace project is governed even when its clone
+  #     isn't itself a git repository (e.g. a docs-only project, or a test
+  #     fixture that never ran `git init`).
+  #   - RAW-AND-RESOLVED containment (security review finding on #885,
+  #     apexyard PR #885 — Hakim/security-reviewer): checking ops-root and
+  #     workspace containment ONLY on the symlink-resolved target has a
+  #     mirror-image hole to the one `_resolve_real_path` fixes. If a
+  #     REGISTERED workspace/<project> entry is ITSELF a symlink whose real
+  #     target lives OUTSIDE workspace/ in a non-git directory
+  #     (`workspace/proj -> /some/nongit/dir`), resolving the target
+  #     "escapes" the workspace boundary the same way the fix escapes a
+  #     symlink-into-repo attack — the RESOLVED path no longer sits under
+  #     WORKSPACE_DIR, so the naive single-check reads it as ungoverned and
+  #     wrongly exempts it. The fix: evaluate ops-root/workspace
+  #     containment against BOTH the RAW (pre-resolution) absolute target
+  #     AND the fully resolved target, using the SAME canonicalized
+  #     boundary anchors for both comparisons (only the anchors are
+  #     canonicalized once; the raw target itself is deliberately left
+  #     symlink-unresolved so a governed raw path can't be laundered away
+  #     by a symlink further down it). A path counts as governed — and
+  #     therefore NOT exempt — if EITHER the raw or the resolved check
+  #     lands inside ops-root or workspace. Exemption requires ALL FOUR
+  #     containment checks below (raw-ops, raw-ws, resolved-ops,
+  #     resolved-ws) to say "outside", plus the git-repo probe to say "not
+  #     in a repo".
+  if [ -n "$FILE_PATH" ]; then
+    local _og_abs_target _og_real_target
+    case "$FILE_PATH" in
+      /*) _og_abs_target="$FILE_PATH" ;;
+      *)  _og_abs_target="$PWD/$FILE_PATH" ;;
+    esac
+    _og_real_target="$(_resolve_real_path "$_og_abs_target")"
+    if [ -n "$_og_real_target" ]; then
+      local _og_has_symlink=0
+      if _ratc_path_has_symlink_component "$_og_abs_target" \
+         || _ratc_path_has_symlink_component "$_og_real_target"; then
+        _og_has_symlink=1
+      fi
+      local _og_in_ops_raw=0
+      local _og_in_ws_raw=0
+      local _og_in_ops_res=0
+      local _og_in_ws_res=0
+      local _og_in_git=0
+      local _og_real_ops="" _og_real_ws="" _og_probe _og_git_root=""
+
+      # Canonicalize the boundary anchors ONCE — used as the comparison
+      # basis for both the raw-target check and the resolved-target check.
+      # This keeps the two checks internally consistent even when OPS_ROOT
+      # was resolved via a non-canonical path (e.g. a CWD-based walk-up
+      # that never ran through `pwd -P`).
+      if [ -n "$OPS_ROOT" ]; then
+        _og_real_ops="$(cd "$OPS_ROOT" 2>/dev/null && pwd -P)"
+      fi
+      if [ -n "$WORKSPACE_DIR" ] && [ -d "$WORKSPACE_DIR" ]; then
+        _og_real_ws="$(cd "$WORKSPACE_DIR" 2>/dev/null && pwd -P)"
+      fi
+
+      # RAW check — the pre-resolution absolute target against the
+      # canonical boundary. Catches a registered workspace/<project> that
+      # is itself a symlink pointing OUTSIDE workspace/: the raw path
+      # still literally names the governed workspace/<project> location,
+      # even though resolving it lands elsewhere.
+      if [ -n "$_og_real_ops" ]; then
+        case "$_og_abs_target" in
+          "$_og_real_ops") _og_in_ops_raw=1 ;;
+          "$_og_real_ops"/*) _og_in_ops_raw=1 ;;
+        esac
+      fi
+      if [ -n "$_og_real_ws" ]; then
+        case "$_og_abs_target" in
+          "$_og_real_ws") _og_in_ws_raw=1 ;;
+          "$_og_real_ws"/*) _og_in_ws_raw=1 ;;
+        esac
+      fi
+
+      # RESOLVED check — the symlink-resolved target against the same
+      # canonical boundary. Catches a symlink OUTSIDE any governed tree
+      # that POINTS INTO one (the original #883 defense).
+      if [ -n "$_og_real_ops" ]; then
+        case "$_og_real_target" in
+          "$_og_real_ops") _og_in_ops_res=1 ;;
+          "$_og_real_ops"/*) _og_in_ops_res=1 ;;
+        esac
+      fi
+      if [ -n "$_og_real_ws" ]; then
+        case "$_og_real_target" in
+          "$_og_real_ws") _og_in_ws_res=1 ;;
+          "$_og_real_ws"/*) _og_in_ws_res=1 ;;
+        esac
+      fi
+
+      # Nearest-existing-ancestor git-repo probe on the REAL (symlink-
+      # resolved) target — catches any git repo, governed or not. A single
+      # probe suffices for both raw and resolved forms: directory
+      # traversal (`-d`, `git -C`) transparently follows symlinks at the
+      # OS level regardless of which path string reaches the location, so
+      # raw-path traversal and resolved-path traversal of the SAME logical
+      # target always land on the same physical directory.
+      _og_probe="$_og_real_target"
+      while [ -n "$_og_probe" ] && [ "$_og_probe" != "/" ] && [ ! -d "$_og_probe" ]; do
+        _og_probe="$(dirname "$_og_probe")"
+      done
+      if [ -n "$_og_probe" ] && [ -d "$_og_probe" ]; then
+        _og_git_root=$(git -C "$_og_probe" rev-parse --show-toplevel 2>/dev/null) || _og_git_root=""
+      fi
+      if [ -n "$_og_git_root" ]; then
+        _og_in_git=1
+      fi
+
+      if [ "$_og_has_symlink" = 0 ] \
+         && [ "$_og_in_ops_raw" = 0 ] && [ "$_og_in_ws_raw" = 0 ] \
+         && [ "$_og_in_ops_res" = 0 ] && [ "$_og_in_ws_res" = 0 ] \
+         && [ "$_og_in_git" = 0 ]; then
+        return 0
+      fi
+
+      # Issue #1402: a session-scoped review may write inside a temporary
+      # standalone clone. The marker must belong to the ops fork that owns
+      # this hook. A linked worktree has a .git file, so it is not a clone.
+      # Every target must also be free of symlinks and pass both governance
+      # boundary checks.
+      if [ "$_og_has_symlink" = 0 ] \
+         && [ "$_og_in_ops_raw" = 0 ] && [ "$_og_in_ws_raw" = 0 ] \
+         && [ "$_og_in_ops_res" = 0 ] && [ "$_og_in_ws_res" = 0 ] \
+         && [ "$_og_in_git" = 1 ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] \
+         && [ -n "$OPS_ROOT" ] && [ -d "$_og_git_root/.git" ] \
+         && git -C "$_og_git_root" remote get-url origin >/dev/null 2>&1 \
+         && [ -f "$HOOK_DIR/_lib-review-markers.sh" ] \
+         && command -v resolve_ops_root_walk >/dev/null 2>&1; then
+        local _review_hook_root _review_marker _review_git_root
+        _review_hook_root=$(resolve_ops_root_walk "$HOOK_DIR")
+        _review_git_root=$(_resolve_real_path "$_og_git_root")
+        if [ -n "$_review_hook_root" ] && [ "$_review_hook_root" = "$_og_real_ops" ] \
+           && [ "$_ratc_cwd_root" = "$_review_hook_root" ] \
+           && [ -n "$_review_git_root" ] \
+           && _ratc_in_temp_dir "$_review_git_root" \
+           && [ "$_og_real_target" != "$_review_git_root" ]; then
+          case "$FILE_PATH" in
+            */../*|*/..) ;;
+            *)
+              case "$_og_real_target" in
+                "$_review_git_root"/*)
+                  # shellcheck source=/dev/null
+                  . "$HOOK_DIR/_lib-review-markers.sh"
+                  _review_marker=$(active_reviewer_marker_path "$OPS_ROOT")
+                  if [ -f "$_review_marker" ] && \
+                     grep -Eq '^[[:alnum:]_.-]+(/[[:alnum:]_.-]+)+#[1-9][0-9]*:(rex|security|architecture)$' "$_review_marker" && \
+                     awk 'END { exit (NR != 1) }' "$_review_marker"; then
+                    return 0
+                  fi
+                  ;;
+              esac
+              ;;
+          esac
+        fi
+      fi
+    fi
+  fi
+
+  # Bootstrap-skill exemption (apexyard#150): skills like /setup,
+  # /handover, /update, /split-portfolio run BEFORE any ticket can exist
+  # (no portfolio configured yet, no projects registered). They write a
+  # marker at .claude/session/active-bootstrap with the skill name on
+  # entry; this hook reads the marker, looks up the configured
+  # bootstrap_skills list, and exits 0 if the active skill is on the list.
+  #
+  # The marker is cleared at SessionStart by clear-bootstrap-marker.sh so
+  # a stale marker from an interrupted session can't carry over.
+  local BOOTSTRAP_MARKER active_bootstrap
+  BOOTSTRAP_MARKER="$MARKER_HOME/.claude/session/active-bootstrap"
+  if [ -f "$BOOTSTRAP_MARKER" ]; then
+    active_bootstrap=$(tr -d '[:space:]' < "$BOOTSTRAP_MARKER" 2>/dev/null)
+    if [ -n "$active_bootstrap" ]; then
+      # Source the config reader and look up bootstrap_skills.
+      if [ -f "$MARKER_HOME/.claude/hooks/_lib-read-config.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$MARKER_HOME/.claude/hooks/_lib-read-config.sh"
+        if command -v config_get >/dev/null 2>&1; then
+          # `config_get '.ticket.bootstrap_skills[]'` outputs one skill per
+          # line. Use grep -wF for whole-word, fixed-string match.
+          if config_get '.ticket.bootstrap_skills[]' 2>/dev/null | grep -qwF "$active_bootstrap"; then
+            return 0
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Marker resolution is shared with the migration gate. Keeping the project
+  # and tier-0/1/2 marker lookup in one implementation prevents the two gates
+  # from authorising the same path against different tickets.
+  local ACTIVE_TICKET_LIB="$HOOK_DIR/_lib-active-ticket.sh"
+  if [ -f "$ACTIVE_TICKET_LIB" ]; then
+    # shellcheck source=/dev/null
+    . "$ACTIVE_TICKET_LIB"
+  fi
+  local MARKER="" PER_WORKTREE_MARKER="" PER_PROJECT_MARKER=""
+  local FALLBACK_MARKER="${MARKER_HOME:-${OPS_ROOT:-${REPO_ROOT:-.}}}/.claude/session/current-ticket"
+  if command -v active_ticket_project_for_path >/dev/null 2>&1; then
+    MARKER=$(active_ticket_marker_for_path "$FILE_PATH")
+  fi
+  if [ -n "$MARKER" ]; then
+    return 0
+  fi
+
+  # Nothing found — emit a guide that names both possibilities.
+  #
+  # The quoted-origin note, when present, sits between the Target line and
+  # "Exempt paths" with a blank line on each side. A plain variable keeps the
+  # trailing newline that a command substitution inside the heredoc would
+  # strip. With no note, the variable is empty and the one blank line stays.
+  local QUOTED_HINT
+  QUOTED_HINT=$(_ratc_quoted_origin_hint "$TOOL_NAME")
+  [ -n "$QUOTED_HINT" ] && QUOTED_HINT=$'\n'"$QUOTED_HINT"$'\n'
+  cat >&2 <<MSG
+BLOCKED: No active ticket set for this session.
+
+ApexYard requires a ticket BEFORE any code changes (workflow-gates rule #3,
+pre-build gate, "one ticket at a time").
+
+To unblock:
+
+  1. Create or find the ticket (GitHub Issue in the project's own repo):
+       gh issue create --repo <owner/repo> --title "..."
+  2. Declare it for this session — run the /start-ticket skill with the
+     issue number (or pass owner/repo#number to pin it). The skill writes
+     a per-project marker if the ticket's repo matches a registered
+     managed project, otherwise falls back to the ops-level marker.
+  3. Retry the edit
+
+Markers looked up for this path (in order):
+$([ -n "$PER_WORKTREE_MARKER" ] && echo "  per-worktree: $PER_WORKTREE_MARKER")
+$([ -n "$PER_PROJECT_MARKER" ] && echo "  per-project:  $PER_PROJECT_MARKER")
+  ops fallback: $FALLBACK_MARKER
+
+Target: ${FILE_PATH:-<unextractable Bash write target>}
+${QUOTED_HINT}
+Exempt paths (no ticket required): .claude/, docs/, projects/*/docs/, *.md
+$(_ratc_stale_hook_notice)
+MSG
+  return 2
+}
+
+# ------------------------------------------------------------------------------
+# Dispatch
+# ------------------------------------------------------------------------------
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // empty' 2>/dev/null)
 
-# Bash-tool path: extract the target file from the command if it appears
+# If jq cannot decode the envelope, do not silently allow an edit/write tool
+# call. The raw check is intentionally limited to tool names whose payloads can
+# change files; unrelated tool calls remain no-ops.
+if [ -z "$TOOL_NAME" ]; then
+  . "$(dirname "$0")/_lib-fail-closed-json.sh"
+  if raw_payload_tool_matches "$INPUT" 'Edit' || \
+     raw_payload_tool_matches "$INPUT" 'Write' || \
+     raw_payload_tool_matches "$INPUT" 'MultiEdit'; then
+    echo "BLOCKED: active-ticket hook cannot parse this file-write request. Restore jq and retry." >&2
+    exit 2
+  fi
+  if raw_payload_tool_matches "$INPUT" 'Bash' && \
+     raw_payload_command_matches "$INPUT" '(tee[[:space:]]|write_(text|bytes)|>[[:space:]]*[A-Za-z0-9_./${-])'; then
+    echo "BLOCKED: active-ticket hook cannot parse this Bash write request. Restore jq and retry." >&2
+    exit 2
+  fi
+fi
+
+# Bash-tool path: extract the target file(s) from the command if it appears
 # to be a write. Closes the bypass surface where Bash file-writes
 # (`echo > file`, `tee file`, `sed -i ... file`, `python -c
 # 'pathlib.Path(...).write_text(...)'`, etc.) routed around the
@@ -73,340 +790,38 @@ if [ "$TOOL_NAME" = "Bash" ]; then
     exit 0
   fi
 
-  # Try to extract a target path so we can apply the same path-based
-  # exemptions (.claude/, docs/, *.md). If extraction fails, FILE_PATH
-  # stays empty and the gate is applied categorically.
-  FILE_PATH=$(bash_extract_write_target "$COMMAND")
+  # Extract ALL write targets (#886) — not just the first. A command can
+  # name more than one (`echo a > /tmp/x; echo b > src/app.ts`, `tee a b
+  # c`); judging only the first let the rest slip past the gate whenever
+  # the first happened to be exempt.
+  ALL_TARGETS=$(bash_extract_write_targets "$COMMAND")
 
-  # Variable target (e.g. `cat > "$VAR"`): the extractor returns the literal
-  # shell-variable token. Exempt a temp-dir var, and a BARE whole-target variable
-  # (`$CEO`, `${marker}` — unresolvable, in practice a .claude/ scratch path). A
-  # variable WITH a concatenated path tail (`$PWD/src/app.ts`, `$D/app.ts`,
-  # `$HOME/work/src/x.ts`) is NOT exempt — that path could be tracked source, and
-  # the old blanket `$*` exemption let such a write dodge the ticket gate (#582
-  # review: fail-open on a security gate). A var+tail target isn't bare and isn't
-  # absolute, so it falls through to the ticket gate below and blocks — which is
-  # the safe direction. (We deliberately do NOT expand $PWD/$HOME here: that adds
-  # nothing for blocking and tripped a /var↔/private/var symlink mismatch.)
-  case "$FILE_PATH" in
-    '$TMPDIR'/*|'${TMPDIR}'/*|'$TMP'/*|'${TMP}'/*) exit 0 ;;  # temp dir → outside the repo
-  esac
-  # Bare whole-target variable only (no path/extension tail) → exempt.
-  if printf '%s' "$FILE_PATH" | grep -qE '^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$'; then
-    exit 0
+  if bash_command_has_unextractable_write "$COMMAND"; then
+    _ratc_evaluate_target "" "Bash" || exit 2
   fi
-fi
 
-if [ -z "$FILE_PATH" ] && [ "$TOOL_NAME" != "Bash" ]; then
+  if [ -z "$ALL_TARGETS" ]; then
+    # No target extractable at all — categorical fail-closed gate, same
+    # as the pre-#886 empty-FILE_PATH behaviour (single call, FILE_PATH="").
+    _ratc_evaluate_target "" "Bash"
+    exit $?
+  fi
+
+  # AND semantics: the command as a whole passes only if EVERY extracted
+  # target independently clears the gate. Stop at (and report) the first
+  # target that doesn't — the overall verdict is already "block" at that
+  # point, so there's nothing to gain from evaluating the rest.
+  while IFS= read -r _tgt; do
+    [ -z "$_tgt" ] && continue
+    if ! _ratc_evaluate_target "$_tgt" "Bash"; then
+      exit 2
+    fi
+  done <<< "$ALL_TARGETS"
+
   exit 0
 fi
 
-# Normalise to repo-relative path when possible.
-#
-# BUG #744 FIX: derive REPO_ROOT from the FILE_PATH's directory, NOT the
-# hook's CWD. The harness can fire with any CWD (e.g. /tmp, the ops root,
-# a totally unrelated directory). Using `git rev-parse --show-toplevel`
-# from the hook process's CWD returns the WRONG root whenever the CWD
-# differs from the file's actual git repo — which breaks the OPS_ROOT
-# walk-up and causes the per-project marker to be missed, blocking edits
-# even when /start-ticket set a valid marker (#744, #745).
-#
-# Resolution order:
-#   1. FILE_PATH is set and absolute: run git in the file's nearest existing
-#      ancestor directory.  Works for new files (dirname of a not-yet-created
-#      path still points at the parent dir).
-#   2. FILE_PATH is set but relative (Bash write-target extracted from the
-#      command): relative paths are relative to the process CWD, so fall
-#      back to the legacy CWD-based git rev-parse — same behaviour as before.
-#   3. FILE_PATH is empty (Bash command, no extractable target): CWD-based
-#      fallback as before.
-REPO_ROOT=""
-if [ -n "$FILE_PATH" ]; then
-  case "$FILE_PATH" in
-    /*)
-      # Absolute path — find the nearest existing ancestor directory.
-      # dirname works on non-existent files; the while loop handles the
-      # case where the new file's parent dir doesn't exist yet.
-      _fp_dir="$(dirname "$FILE_PATH")"
-      while [ -n "$_fp_dir" ] && [ "$_fp_dir" != "/" ] && [ ! -d "$_fp_dir" ]; do
-        _fp_dir="$(dirname "$_fp_dir")"
-      done
-      if [ -d "$_fp_dir" ]; then
-        REPO_ROOT=$(git -C "$_fp_dir" rev-parse --show-toplevel 2>/dev/null)
-        # When the file's repo is a LINKED git worktree the worktree dir
-        # inherits the main branch's files — including anchor files like
-        # onboarding.yaml / apexyard.projects.yaml.  The OPS_ROOT walk-up
-        # below would then stop at the worktree instead of the real ops
-        # fork.  Detect a linked worktree (absolute git-dir ≠ common-dir)
-        # and replace REPO_ROOT with the main-checkout root (dirname of
-        # the common-dir, i.e. parent of the main .git dir).  This keeps
-        # the walk-up anchored to the actual ops fork while leaving the
-        # later per-worktree branch detection (which re-reads git from
-        # _fdir) unaffected.
-        if [ -n "$REPO_ROOT" ]; then
-          _wt_gd=$(git -C "$_fp_dir" rev-parse --absolute-git-dir 2>/dev/null)
-          _wt_gcd=$(git -C "$_fp_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-          if [ -n "$_wt_gd" ] && [ -n "$_wt_gcd" ] && [ "$_wt_gd" != "$_wt_gcd" ]; then
-            _main_root=$(dirname "$_wt_gcd")
-            [ -d "$_main_root" ] && REPO_ROOT="$_main_root"
-          fi
-        fi
-      fi
-      ;;
-    *)
-      # Relative path (Bash write-target): resolve against CWD.
-      REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-      ;;
-  esac
-fi
-# Fallback: FILE_PATH empty (Bash command, no extractable target).
-if [ -z "$REPO_ROOT" ]; then
-  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-fi
-REL_PATH="$FILE_PATH"
-if [ -n "$REPO_ROOT" ] && [ -n "$FILE_PATH" ]; then
-  case "$FILE_PATH" in
-    "$REPO_ROOT"/*) REL_PATH="${FILE_PATH#$REPO_ROOT/}" ;;
-  esac
-fi
-
-# Bash-write: absolute paths outside the repo root are outside the tracked
-# source tree (e.g. /tmp/, /var/, /usr/, system-temp paths). A write there
-# cannot mutate apexyard-governed content, so no ticket is required (#569).
-# This check runs only for the Bash path (FILE_PATH set via extractor) and
-# only when FILE_PATH is absolute and does NOT strip to a REL_PATH (meaning
-# it's outside REPO_ROOT). We conservatively skip this for non-Bash tools —
-# they supply an explicit file_path from the tool call that we trust fully.
-if [ "$TOOL_NAME" = "Bash" ] && [ -n "$FILE_PATH" ] && [ -n "$REPO_ROOT" ]; then
-  case "$FILE_PATH" in
-    /*)
-      # Absolute path — was it stripped to a repo-relative form?
-      if [ "$REL_PATH" = "$FILE_PATH" ]; then
-        # REL_PATH is still absolute: FILE_PATH is NOT under REPO_ROOT.
-        # It's a system path or temp path — exempt.
-        exit 0
-      fi
-      ;;
-  esac
-fi
-
-# Exempt paths.
-#
-# Each path-prefix exemption is matched in both REL_PATH (repo-relative)
-# and absolute (*/path/*) forms. Absolute-path fallthrough happens when
-# FILE_PATH points outside REPO_ROOT (e.g. agent worktrees whose
-# git-toplevel differs from the outer apexyard tree); in that case the
-# strip on lines 43-45 is a no-op and REL_PATH stays absolute. The
-# existing `*.md` pattern already crosses `/`, so absolute-match via a
-# `*/…` prefix is a known-good shape — #56 extends the same trick to the
-# path-prefix exemptions.
-#
-# Skipped entirely when FILE_PATH is empty (Bash command writes to an
-# unextractable target — e.g. `python -c '...write...'`). Those fall
-# through to the ticket gate; the bootstrap-skill exemption below covers
-# the legitimate use case (/setup writing to fork-root files via Bash).
-if [ -n "$REL_PATH" ]; then
-  case "$REL_PATH" in
-    .claude/*|.claude|*/.claude/*|*/.claude) exit 0 ;;
-    docs/*|docs|*/docs/*|*/docs) exit 0 ;;
-    TODO.md|README.md|MEMORY.md|CLAUDE.md) exit 0 ;;
-  esac
-  # Note: `projects/*/docs/*` is subsumed by `*/docs/*` above (shell case `*`
-  # crosses `/`), so no separate arm needed. Per-project apexyard docs are
-  # matched by the generic docs-in-any-subtree pattern.
-  case "$REL_PATH" in
-    *.md) exit 0 ;;
-  esac
-fi
-
-# Discover the ops root. Walk up from REPO_ROOT looking for either the
-# v2 `.apexyard-fork` marker (split-portfolio v2 layout) OR the legacy
-# v1 anchor (onboarding.yaml + apexyard.projects.yaml). Stop at /. If
-# not found, OPS_ROOT stays empty and we treat the REPO_ROOT itself as
-# the marker home (pre-#41 behaviour).
-#
-# Guard change (#744/#745): the lib-based resolver is always invoked when
-# the lib is available — even when REPO_ROOT is empty. This matters for
-# split-portfolio v2 where the workspace is a sibling repo with no git
-# history: REPO_ROOT is empty (no git in the sibling dir) but the
-# session-pin resolver in _lib-ops-root.sh can still locate the ops fork
-# from the pin written at session-start, regardless of start dir.
-HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-OPS_ROOT=""
-if [ -f "$HOOK_DIR/_lib-ops-root.sh" ]; then
-  # shellcheck source=/dev/null
-  . "$HOOK_DIR/_lib-ops-root.sh"
-  # Pass REPO_ROOT as the walk-up start dir when available; the pin
-  # resolver ignores the start dir and uses the session pin directly.
-  OPS_ROOT=$(resolve_ops_root "${REPO_ROOT:-}")
-elif [ -n "$REPO_ROOT" ]; then
-  # Inline walk-up fallback when the lib is absent (e.g. minimal test
-  # sandboxes that only copy the core libs).
-  r="$REPO_ROOT"
-  while [ -n "$r" ] && [ "$r" != "/" ]; do
-    if [ -f "$r/.apexyard-fork" ]; then
-      OPS_ROOT="$r"
-      break
-    fi
-    if [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; then
-      OPS_ROOT="$r"
-      break
-    fi
-    parent=$(dirname "$r"); [ "$parent" = "$r" ] && break; r="$parent"
-  done
-fi
-
-MARKER_HOME="${OPS_ROOT:-$REPO_ROOT}"
-MARKER_HOME="${MARKER_HOME:-.}"
-
-# Resolve the workspace dir for the per-project marker resolution below.
-# Defaults to $OPS_ROOT/workspace; split-portfolio v2 adopters override
-# via portfolio.workspace_dir to point at their private sibling repo.
-WORKSPACE_DIR="$OPS_ROOT/workspace"
-if [ -n "$OPS_ROOT" ] && [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ] && [ -f "$HOOK_DIR/_lib-read-config.sh" ]; then
-  # shellcheck source=/dev/null
-  . "$HOOK_DIR/_lib-read-config.sh"
-  # shellcheck source=/dev/null
-  . "$HOOK_DIR/_lib-portfolio-paths.sh"
-  resolved_ws=$(portfolio_workspace_dir 2>/dev/null)
-  if [ -n "$resolved_ws" ]; then
-    WORKSPACE_DIR="$resolved_ws"
-  fi
-fi
-
-# Bootstrap-skill exemption (apexyard#150): skills like /setup,
-# /handover, /update, /split-portfolio run BEFORE any ticket can exist
-# (no portfolio configured yet, no projects registered). They write a
-# marker at .claude/session/active-bootstrap with the skill name on
-# entry; this hook reads the marker, looks up the configured
-# bootstrap_skills list, and exits 0 if the active skill is on the list.
-#
-# The marker is cleared at SessionStart by clear-bootstrap-marker.sh so
-# a stale marker from an interrupted session can't carry over.
-BOOTSTRAP_MARKER="$MARKER_HOME/.claude/session/active-bootstrap"
-if [ -f "$BOOTSTRAP_MARKER" ]; then
-  active_bootstrap=$(tr -d '[:space:]' < "$BOOTSTRAP_MARKER" 2>/dev/null)
-  if [ -n "$active_bootstrap" ]; then
-    # Source the config reader and look up bootstrap_skills.
-    if [ -f "$MARKER_HOME/.claude/hooks/_lib-read-config.sh" ]; then
-      # shellcheck source=/dev/null
-      . "$MARKER_HOME/.claude/hooks/_lib-read-config.sh"
-      if command -v config_get >/dev/null 2>&1; then
-        # `config_get '.ticket.bootstrap_skills[]'` outputs one skill per
-        # line. Use grep -wF for whole-word, fixed-string match.
-        if config_get '.ticket.bootstrap_skills[]' 2>/dev/null | grep -qwF "$active_bootstrap"; then
-          exit 0
-        fi
-      fi
-    fi
-  fi
-fi
-
-# Per-project resolution (apexyard#41): if FILE_PATH points under the
-# resolved workspace dir, we look for a per-project marker at
-# .claude/session/tickets/<project>. This keeps per-project session state
-# keyed by the managed-project name and localised in the ops fork
-# (gitignored), instead of the pre-#41 scheme that relied on a
-# .claude/session/ inside each managed-project clone.
-#
-# Split-portfolio v2 (#242): WORKSPACE_DIR may resolve to a sibling
-# private repo path (e.g. ../<fork>-portfolio/workspace) instead of the
-# default $OPS_ROOT/workspace; both shapes are handled here.
-PROJECT=""
-if [ -n "$WORKSPACE_DIR" ]; then
-  case "$FILE_PATH" in
-    "$WORKSPACE_DIR"/*)
-      tail="${FILE_PATH#$WORKSPACE_DIR/}"
-      PROJECT="${tail%%/*}"
-      ;;
-  esac
-fi
-# Belt-and-suspenders: also recognise the literal $OPS_ROOT/workspace/
-# shape, in case workspace_dir is overridden but a tool produced an
-# absolute path under the in-fork legacy location.
-if [ -z "$PROJECT" ] && [ -n "$OPS_ROOT" ]; then
-  case "$FILE_PATH" in
-    "$OPS_ROOT"/workspace/*)
-      tail="${FILE_PATH#$OPS_ROOT/workspace/}"
-      PROJECT="${tail%%/*}"
-      ;;
-  esac
-fi
-
-# Tier 0 — per-worktree marker (#513): when two agents are fanned out on the
-# SAME managed project in parallel git worktrees, each must declare its ticket
-# independently or they collide on the shared per-project file (last-writer-wins,
-# silent wrong-ticket pass). A branch-scoped marker at
-# tickets/<project>/<safe-branch> is resolved BEFORE the per-project tier.
-# Single-agent / non-worktree flows have no such marker and fall straight
-# through to the per-project tier — no behaviour change. Note: tickets/<project>
-# is a FILE in single-agent mode and a DIRECTORY in worktree mode; the `-f`
-# tests below distinguish them, so the two tiers never conflict.
-PER_WORKTREE_MARKER=""
-if [ -n "$PROJECT" ]; then
-  # Branch: prefer the harness-set env var (populated at worktree spawn). Else
-  # only treat the file's repo as worktree-scoped when it's a LINKED worktree,
-  # detected by comparing the ABSOLUTE git-dir against the ABSOLUTE common-dir
-  # (they differ only in a linked worktree). This matches /start-ticket's
-  # write-side detection exactly — no read/write asymmetry — and the absolute
-  # forms avoid the false positive where, in the main checkout from a subdir,
-  # `--git-dir` is absolute but `--git-common-dir` is relative.
-  WT_BRANCH="${CLAUDE_WORKTREE_BRANCH:-}"
-  if [ -z "$WT_BRANCH" ]; then
-    _fdir=$(dirname "$FILE_PATH")
-    _gd=$(git -C "$_fdir" rev-parse --absolute-git-dir 2>/dev/null)
-    _gcd=$(git -C "$_fdir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-    if [ -n "$_gd" ] && [ "$_gd" != "$_gcd" ]; then
-      WT_BRANCH=$(git -C "$_fdir" branch --show-current 2>/dev/null)
-    fi
-  fi
-  if [ -n "$WT_BRANCH" ]; then
-    SAFE_BRANCH="${WT_BRANCH//\//__}"   # '/' → '__' for a filesystem-safe segment
-    PER_WORKTREE_MARKER="$MARKER_HOME/.claude/session/tickets/$PROJECT/$SAFE_BRANCH"
-    if [ -f "$PER_WORKTREE_MARKER" ]; then
-      exit 0
-    fi
-  fi
-fi
-
-PER_PROJECT_MARKER=""
-if [ -n "$PROJECT" ]; then
-  PER_PROJECT_MARKER="$MARKER_HOME/.claude/session/tickets/$PROJECT"
-  if [ -f "$PER_PROJECT_MARKER" ]; then
-    exit 0
-  fi
-fi
-
-# Fallback: the ops-level current-ticket marker. This is the pre-#41
-# location and still honoured for ops-repo framework edits, and as a
-# safety net for any file we couldn't map to a specific project.
-FALLBACK_MARKER="$MARKER_HOME/.claude/session/current-ticket"
-if [ -f "$FALLBACK_MARKER" ]; then
-  exit 0
-fi
-
-# Nothing found — emit a guide that names both possibilities.
-cat >&2 <<MSG
-BLOCKED: No active ticket set for this session.
-
-ApexYard requires a ticket BEFORE any code changes (workflow-gates rule #3,
-pre-build gate, "one ticket at a time").
-
-To unblock:
-
-  1. Create or find the ticket (GitHub Issue in the project's own repo):
-       gh issue create --repo <owner/repo> --title "..."
-  2. Declare it for this session — run the /start-ticket skill with the
-     issue number (or pass owner/repo#number to pin it). The skill writes
-     a per-project marker if the ticket's repo matches a registered
-     managed project, otherwise falls back to the ops-level marker.
-  3. Retry the edit
-
-Markers looked up for this path (in order):
-$([ -n "$PER_WORKTREE_MARKER" ] && echo "  per-worktree: $PER_WORKTREE_MARKER")
-$([ -n "$PER_PROJECT_MARKER" ] && echo "  per-project:  $PER_PROJECT_MARKER")
-  ops fallback: $FALLBACK_MARKER
-
-Exempt paths (no ticket required): .claude/, docs/, projects/*/docs/, *.md
-MSG
-exit 2
+# Non-Bash tool call (Edit/Write/MultiEdit): a single, explicit file_path —
+# no multi-target concern, one evaluation.
+_ratc_evaluate_target "$FILE_PATH" "$TOOL_NAME"
+exit $?

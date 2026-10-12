@@ -2,10 +2,13 @@
 name: prototype
 description: Create a throwaway UX/demo prototype ticket (mockup / demo flow) — answers "what should it look and feel like?". DISCARD-by-default; same AgDR + coverage exemptions as /spike.
 argument-hint: "<short title of the prototype>"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # /prototype — Create a Throwaway Prototype Ticket
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for prototype
+artefacts: lead with the learning goal and next action.
 
 Creates a structured GitHub Issue for a **prototype** — a disposable UX/demo artifact (clickable mockup, demo flow, interactive proof-of-concept UI) built to answer *"what should this look and feel like?"*. The output is the **learning / chosen direction**, not shippable code: a prototype is thrown away once the direction is decided.
 
@@ -40,6 +43,11 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 ```
 
 ## Process
+
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
 
 ### 0. Write the active-issue-skill marker (REQUIRED — me2resh/apexyard#268)
 
@@ -142,6 +150,9 @@ At the budget cap, the prototype ENDS regardless of polish. What's yours?
 Reject vague answers ("a while", "until it's pretty") — push for an explicit time/effort cap.
 
 **d) Disposition (required — PROMOTE or DISCARD)**
+
+Use `AskUserQuestion` for this choice. Recommend `DISCARD` first and describe both effects.
+Use the prompt below only when the harness lacks the tool.
 
 ```
 What happens when the prototype closes — PROMOTE or DISCARD?

@@ -1,86 +1,208 @@
 #!/bin/bash
-# _lib-tracker.sh — tracker-agnostic existence verification + ID-shape regex.
+# _lib-tracker.sh — tracker-agnostic issue and review operations.
 #
-# Source this library from any hook or skill that needs to verify a ticket
-# exists in the adopter's tracker (GitHub Issues, Linear, Jira, Asana, custom).
-# It dispatches based on the `tracker` block of .claude/project-config.{defaults,}.json.
+# Source this library from a hook or skill that needs tracker access. The
+# library dispatches through the `tracker` block in
+# .claude/project-config.{defaults,}.json.
 #
-# Resolved at config time:
-#   tracker.kind         — "gh" | "linear" | "jira" | "asana" | "custom" | "none"
-#   tracker.view_command — template string with {id} and {owner_repo} placeholders
-#   tracker.id_pattern   — regex for valid ticket-ID shape (no-existence-check fallback)
+# Main settings:
+#   tracker.kind         — legacy adapter for both axes
+#   tracker.issue_kind   — adapter for issue operations
+#   tracker.review_kind  — adapter for pull or merge request operations
+#   tracker.view_command — template with {id} and {owner_repo} placeholders
+#   tracker.id_pattern   — ticket-ID shape used by shape-only checks
 #
 # Public functions:
-#   tracker_kind [<owner/repo>]        echoes the configured tracker kind
+#   tracker_issue_kind [<owner/repo>]  echoes the issue-system adapter kind
+#   tracker_review_kind [<owner/repo>] echoes the code-review host adapter kind
+#   tracker_kind [<owner/repo>]        compatibility alias for tracker_issue_kind
 #   tracker_id_pattern [<owner/repo>]  echoes the configured ID regex
 #   tracker_owner_repo_param <slug>    formats the owner/repo parameter (gh: "owner/repo"; others: empty)
 #   tracker_view <id> [<owner_repo>]   dispatches the view command and emits normalised JSON on stdout
 #                                      Exit 0 = ticket exists; non-zero = doesn't, or CLI errored.
-#                                      JSON shape: {"state":..., "title":..., "url":..., "labels":[...]}
+#                                      JSON shape: {"state":..., "title":..., "url":..., "labels":[...], "body":...}
+#                                      `body` is populated for the gh, glab, jira, linear, and asana
+#                                      adapters — every built-in kind the migration gate (which reads
+#                                      the body to find the linked AgDR, #755/#761) can query. jira's
+#                                      `.fields.description` may be ADF (a JSON object, not a string)
+#                                      on Jira Cloud; the adapter flattens ADF text nodes to plain
+#                                      text so the body stays grep-able (Jira Server/DC returns a
+#                                      plain string, passed through). The `custom` adapter still omits
+#                                      body unless the operator's `normalise_jq` emits one (consumers
+#                                      read it as `.body // empty`).
+#   tracker_create <owner/repo> <title> [<body_file>] [<labels_csv>]
+#                                      creates a ticket via the per-project CLI; emits {ref,url}.
+#   tracker_review_submit <owner/repo> <pr> <verdict> [<body_file>]  (#758)
+#                                      submits a PR/MR review to the git host. verdict is one of
+#                                      approve|comment|request-changes (default comment). gh + glab
+#                                      adapters built in, `custom` review_command template, `none`
+#                                      no-op (returns 3, echoes body). Exit 0 = submitted; non-zero
+#                                      = CLI errored; 3 = shape-only (kind=none, nothing to call).
+#   tracker_pr_merge <owner/repo> <pr> <strategy> [<delete_branch>] [<subject>] [<body_file>]  (#759, #1136)
+#                                      merges a PR/MR via the git host. strategy is one of
+#                                      squash|merge|rebase (default squash, normalised — never
+#                                      eval'd raw); delete_branch is true|false (default true).
+#                                      subject/body_file are OPTIONAL (gh kind only): each non-empty
+#                                      value adds its matching `--subject "$subject"` or `--body-file
+#                                      "$body_file"` flag, so a caller can preserve either field
+#                                      independently instead of relying on the repo's default
+#                                      squash-body assembly (see #1136 — under
+#                                      `squash_merge_commit_message=COMMIT_MESSAGES` a bare squash
+#                                      concatenates every commit message on the PR branch, burying
+#                                      any trailer that isn't in the final paragraph). body_file
+#                                      MUST be a regular, readable, non-empty file when supplied —
+#                                      the guard tests `-f`, `-r`, and `-s` on body_file alone and
+#                                      fails closed (returns 1) rather than silently falling back to
+#                                      a bare squash. gh + glab adapters built in, `custom`
+#                                      merge_command template, `none` no-op (returns 3). Exit 0 =
+#                                      merged, emits normalised JSON {"sha":...} (the merge commit,
+#                                      best-effort — empty for `custom`); non-zero = CLI errored /
+#                                      blocked / body_file unreadable; 3 = shape-only (kind=none,
+#                                      nothing to call).
 #
-# Per-project resolution (#670 / AgDR-0072): tracker_kind / tracker_id_pattern /
-# tracker_view take an OPTIONAL owner/repo. When supplied, a `tracker:` block on
-# that project's apexyard.projects.yaml entry overrides the global config block
-# (per key); when omitted, the global block is used — byte-for-byte the original
-# behaviour. The project is chosen by the OPERATION'S TARGET REPO the caller
-# already holds — never by cwd or a session-global marker.
+# Per-project resolution (#670 / AgDR-0072) accepts an optional owner/repo.
+# That repo selects the registry entry and its tracker overrides. Without a
+# repo, the library uses the global config. It never uses cwd or session state.
 #
-# Normalisation: each adapter parses the underlying CLI's JSON (gh / linear /
-# jira / asana / custom) into the common shape above. Consumers should only
-# touch the normalised fields — never reach for adapter-specific shapes.
+# Each adapter maps CLI output to one common JSON shape. Consumers must use the
+# common fields and must not depend on adapter-specific output.
 #
 # `tracker.kind = none` makes `tracker_view` a no-op that exits 1 (no
 # existence check possible). Consumers should fall back to shape-only
 # verification using `tracker_id_pattern`.
 #
-# Caching: results cached per-process in shell vars. Same pattern as
-# _CONFIG_CACHE in _lib-read-config.sh and _PORTFOLIO_*_CACHE in
-# _lib-portfolio-paths.sh.
+# Results use per-process shell caches, like the config and portfolio helpers.
 
 # ------------------------------------------------------------------------------
-# Internal: ensure _lib-read-config.sh is loaded so config_get_or works.
+# Internal: load _lib-read-config.sh for one tracker config read.
+#
+# Self-location note (#1025): ${BASH_SOURCE[0]} is bash-only. Under zsh it is
+# UNSET, not merely empty — a bare reference errors ("parameter not set")
+# whenever the caller's shell has nounset active (`set -u`, common in
+# defensive script headers), and even without nounset an empty value makes
+# `dirname` resolve to ".", silently pointing hook_dir at the CALLER's cwd
+# instead of this lib's real directory (same failure class as #950). The
+# `:-` default below neutralises the hard error under either shell; the
+# `git rev-parse --show-toplevel` fallback is the actual portability fix —
+# it works identically under bash and zsh because it depends on `git`, not
+# on a bash-only parameter. Only fall back when the BASH_SOURCE-derived path
+# didn't actually find the sibling file, so the common (bash) path stays a
+# single cheap resolution. Returns non-zero when the lib still isn't
+# loadable after both attempts, so callers can tell "loaded" from "silently
+# gave up" instead of always reading exit 0 (part of the #1025 fix — see
+# _tracker_load_portfolio_lib below for the case this asymmetry actually broke).
 # ------------------------------------------------------------------------------
 _tracker_load_config_lib() {
-  if command -v config_get_or >/dev/null 2>&1; then
-    return 0
-  fi
   local root hook_dir
-  hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "$hook_dir/_lib-read-config.sh" ]; then
-    # shellcheck source=/dev/null
-    . "$hook_dir/_lib-read-config.sh"
-    return 0
+  hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
+  # me2resh/apexyard#1062: under a non-bash shell BASH_SOURCE is empty, so the resolution above
+  # degrades to the CALLER's cwd (dirname "" -> "."). Discard a cwd-derived path so the anchored
+  # git-root check below must validate it; a genuine BASH_SOURCE path is where this file lives and
+  # is kept as-is (#1061 only anchored the git-derived fallback, not this cwd-derived branch).
+  if [ -z "${BASH_SOURCE[0]:-}" ]; then hook_dir=""; fi
+  if [ -z "$hook_dir" ] || [ ! -f "$hook_dir/_lib-read-config.sh" ]; then
+    root=$(git rev-parse --show-toplevel 2>/dev/null)
+    # me2resh/apexyard#1033: only accept a git-derived root that is actually
+    # an apexyard fork. Without this the fallback sources a trust-chain
+    # library out of ANY repo the cwd happens to be inside -- a
+    # workspace/<project> clone, or an unrelated checkout.
+    #
+    # This narrows an ACCIDENT surface. It is NOT an access-control boundary:
+    # the anchors are unauthenticated presence-only files, and -f follows
+    # symlinks, so anyone able to write to the candidate root can satisfy it.
+    # What it prevents is a cwd-driven misresolution, not a hostile library.
+    # Anchor pair per AgDR-0021 §A/§E -- the same test
+    # resolve_ops_root_walk applies, evaluated against one candidate rather
+    # than a walk. (resolve_ops_root itself is unusable here: three of these
+    # sites are locating _lib-ops-root.sh, and its pin is session-scoped.)
+    if [ -n "$root" ] && { [ -f "$root/.apexyard-fork" ] || { [ -f "$root/onboarding.yaml" ] && [ -f "$root/apexyard.projects.yaml" ]; }; } && [ -f "$root/.claude/hooks/_lib-read-config.sh" ]; then
+      hook_dir="$root/.claude/hooks"
+    fi
   fi
-  root=$(git rev-parse --show-toplevel 2>/dev/null)
-  if [ -n "$root" ] && [ -f "$root/.claude/hooks/_lib-read-config.sh" ]; then
-    # shellcheck source=/dev/null
-    . "$root/.claude/hooks/_lib-read-config.sh"
-  fi
+  [ -n "$hook_dir" ] && [ -f "$hook_dir/_lib-read-config.sh" ] || return 1
+  # shellcheck source=/dev/null
+  . "$hook_dir/_lib-read-config.sh" || return 1
+  command -v config_get_or >/dev/null 2>&1
 }
+
+# Keep the reader and its per-process caches inside this subshell. Always load
+# the sibling library here: an inherited config_get_or can hold another root.
+_tracker_config_get_or() (
+  _tracker_load_config_lib || return 1
+  config_get_or "$@"
+)
 
 # ------------------------------------------------------------------------------
 # Internal: ensure _lib-portfolio-paths.sh is loaded so portfolio_registry works.
+#
+# Same zsh self-location hazard and fix shape as _tracker_load_config_lib
+# above (#1025) — but this function previously had NO git-rev-parse fallback
+# at all, unlike its sibling. Under zsh it would resolve hook_dir to the
+# caller's cwd, fail the `-f` test, and silently `return 0` having loaded
+# nothing. That asymmetry is what #1025 actually observed: a per-project
+# tracker.kind override (read via portfolio_registry, in
+# _tracker_project_value) silently stopped resolving under zsh, and callers
+# fell through to the global tracker.kind default with no signal anything
+# had gone wrong. Fixed to match the sibling's fallback + explicit
+# success/failure return.
 # ------------------------------------------------------------------------------
 _tracker_load_portfolio_lib() {
   if command -v portfolio_registry >/dev/null 2>&1; then
     return 0
   fi
-  local hook_dir
-  hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "$hook_dir/_lib-portfolio-paths.sh" ]; then
+  local hook_dir root
+  hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
+  # me2resh/apexyard#1062: under a non-bash shell BASH_SOURCE is empty, so the resolution above
+  # degrades to the CALLER's cwd (dirname "" -> "."). Discard a cwd-derived path so the anchored
+  # git-root check below must validate it; a genuine BASH_SOURCE path is where this file lives and
+  # is kept as-is (#1061 only anchored the git-derived fallback, not this cwd-derived branch).
+  if [ -z "${BASH_SOURCE[0]:-}" ]; then hook_dir=""; fi
+  if [ -z "$hook_dir" ] || [ ! -f "$hook_dir/_lib-portfolio-paths.sh" ]; then
+    root=$(git rev-parse --show-toplevel 2>/dev/null)
+    # me2resh/apexyard#1033: only accept a git-derived root that is actually
+    # an apexyard fork. Without this the fallback sources a trust-chain
+    # library out of ANY repo the cwd happens to be inside -- a
+    # workspace/<project> clone, or an unrelated checkout.
+    #
+    # This narrows an ACCIDENT surface. It is NOT an access-control boundary:
+    # the anchors are unauthenticated presence-only files, and -f follows
+    # symlinks, so anyone able to write to the candidate root can satisfy it.
+    # What it prevents is a cwd-driven misresolution, not a hostile library.
+    # Anchor pair per AgDR-0021 §A/§E -- the same test
+    # resolve_ops_root_walk applies, evaluated against one candidate rather
+    # than a walk. (resolve_ops_root itself is unusable here: three of these
+    # sites are locating _lib-ops-root.sh, and its pin is session-scoped.)
+    if [ -n "$root" ] && { [ -f "$root/.apexyard-fork" ] || { [ -f "$root/onboarding.yaml" ] && [ -f "$root/apexyard.projects.yaml" ]; }; } && [ -f "$root/.claude/hooks/_lib-portfolio-paths.sh" ]; then
+      hook_dir="$root/.claude/hooks"
+    fi
+  fi
+  if [ -n "$hook_dir" ] && [ -f "$hook_dir/_lib-portfolio-paths.sh" ]; then
     # shellcheck source=/dev/null
     . "$hook_dir/_lib-portfolio-paths.sh"
   fi
+  command -v portfolio_registry >/dev/null 2>&1
 }
 
 # ------------------------------------------------------------------------------
 # Internal: _tracker_project_value <owner/repo> <key>
-#   Reads `.projects[] | select(.repo == <owner/repo>) | .tracker.<key>` from the
+#   Reads `.projects[] | select(<repo matches>) | .tracker.<key>` from the
 #   portfolio registry (apexyard.projects.yaml) — the per-project override for
 #   one tracker key (kind / id_pattern / view_command / create_command).
 #
 #   The project is selected by the OPERATION'S TARGET REPO passed in by the
 #   caller — never by cwd or a session-global marker (see AgDR-0072 / #670).
+#
+#   me2resh/apexyard#1123 — a project may declare a PLURAL `repos:` list
+#   instead of (or alongside) the singular `repo:`, for a product split
+#   across several repos governed as one thing. A caller can legitimately
+#   pass the target repo for ANY of that project's repos — not only its
+#   `primary:` — so the selector matches on `repo == <owner/repo>` OR
+#   `<owner/repo>` is a member of `repos[]`. Before this fix, resolving a
+#   non-primary repo silently missed the project's tracker override
+#   entirely and fell back to the global config — the opposite of "tracker
+#   resolution... accepts explicit --repo for the others" (#1123 AC).
+#   Singular-only projects are unaffected: `repos` is simply absent/empty
+#   for them, so the added OR-arm never matches anything extra.
 #
 #   Echoes the value and exits 0 when a non-empty override exists; exits 1
 #   (empty stdout) otherwise — so callers fall back to the global config block.
@@ -105,7 +227,11 @@ _tracker_project_value() {
     # quote, but the python3 path below is argv-safe, so match it here). $key is
     # always a hardcoded literal from callers (kind / id_pattern / view_command),
     # so substituting it into the path is safe.
-    val=$(REPO="$repo" yq eval ".projects[] | select(.repo == strenv(REPO)) | .tracker.$key // \"\"" "$registry" 2>/dev/null | head -1)
+    # `contains([...])`, not `index(...)` — mikefarah yq v4's lexer rejects
+    # `index()` outright ("invalid input text"), which a bare 2>/dev/null
+    # here would otherwise turn into a silent "no override found" rather
+    # than a visible error. Verified against yq v4.53.3.
+    val=$(REPO="$repo" yq eval ".projects[] | select(.repo == strenv(REPO) or ((.repos // []) | contains([strenv(REPO)]))) | .tracker.$key // \"\"" "$registry" 2>/dev/null | head -1)
   fi
   if { [ -z "$val" ] || [ "$val" = "null" ]; } && command -v python3 >/dev/null 2>&1; then
     val=$(python3 - "$registry" "$repo" "$key" <<'PY' 2>/dev/null
@@ -120,7 +246,7 @@ try:
 except Exception:
     sys.exit(0)
 for p in (doc.get("projects") or []):
-    if p.get("repo") == repo:
+    if p.get("repo") == repo or repo in (p.get("repos") or []):
         v = (p.get("tracker") or {}).get(key)
         if v is not None:
             print(v)
@@ -136,36 +262,66 @@ PY
 }
 
 # ------------------------------------------------------------------------------
-# Public: tracker_kind [<owner/repo>]
-#   Echoes the configured tracker kind. With an optional <owner/repo>, a
-#   per-project `tracker.kind` override in the registry wins; otherwise the
-#   global config block (default "gh"). The no-arg path is byte-for-byte the
-#   original behaviour (cached).
+# Public: tracker_issue_kind / tracker_review_kind [<owner/repo>]
+#   Resolve the two independent tracker axes. New config uses
+#   `tracker.issue_kind` and `tracker.review_kind`; legacy `tracker.kind` is
+#   the fallback for both axes, preserving existing projects byte-for-byte.
 # ------------------------------------------------------------------------------
-_TRACKER_KIND_CACHE=""
-tracker_kind() {
-  local repo="${1:-}"
+_tracker_axis_kind() {
+  local axis="$1" repo="${2:-}" key="${1}_kind" legacy="kind" pv="" k=""
+  case "$axis" in issue|review) : ;; *) return 1 ;; esac
   if [ -n "$repo" ]; then
-    local pv
-    if pv=$(_tracker_project_value "$repo" kind) && [ -n "$pv" ]; then
+    if pv=$(_tracker_project_value "$repo" "$key") && [ -n "$pv" ]; then
+      echo "$pv"
+      return 0
+    fi
+    if pv=$(_tracker_project_value "$repo" "$legacy") && [ -n "$pv" ]; then
       echo "$pv"
       return 0
     fi
   fi
-  if [ -z "$repo" ] && [ -n "$_TRACKER_KIND_CACHE" ]; then
-    echo "$_TRACKER_KIND_CACHE"
+  if [ "$axis" = "issue" ]; then
+    k="${_TRACKER_ISSUE_KIND_CACHE:-}"
+  else
+    k="${_TRACKER_REVIEW_KIND_CACHE:-}"
+  fi
+  if [ -z "$repo" ] && [ -n "$k" ]; then
+    echo "$k"
     return 0
   fi
-  _tracker_load_config_lib
-  local k
-  k=$(config_get_or '.tracker.kind' 'gh' 2>/dev/null)
+  k=$(_tracker_config_get_or ".tracker.$key" '' 2>/dev/null)
+  if [ -z "$k" ] || [ "$k" = "null" ]; then
+    k=$(_tracker_config_get_or '.tracker.kind' 'gh' 2>/dev/null)
+  fi
   if [ -z "$k" ] || [ "$k" = "null" ]; then
     k="gh"
   fi
   if [ -z "$repo" ]; then
-    _TRACKER_KIND_CACHE="$k"
+    if [ "$axis" = "issue" ]; then
+      _TRACKER_ISSUE_KIND_CACHE="$k"
+    else
+      _TRACKER_REVIEW_KIND_CACHE="$k"
+    fi
   fi
   echo "$k"
+}
+
+_TRACKER_ISSUE_KIND_CACHE=""
+_TRACKER_REVIEW_KIND_CACHE=""
+tracker_issue_kind() { _tracker_axis_kind issue "${1:-}"; }
+tracker_review_kind() { _tracker_axis_kind review "${1:-}"; }
+_TRACKER_KIND_CACHE=""
+tracker_kind() {
+  local repo="${1:-}" value
+  # Preserve the historical cache variable because existing consumers and
+  # tests may set it directly when stubbing the legacy resolver.
+  if [ -z "$repo" ] && [ -n "$_TRACKER_KIND_CACHE" ]; then
+    echo "$_TRACKER_KIND_CACHE"
+    return 0
+  fi
+  value=$(tracker_issue_kind "$repo") || return $?
+  [ -z "$repo" ] && _TRACKER_KIND_CACHE="$value"
+  echo "$value"
 }
 
 # ------------------------------------------------------------------------------
@@ -190,9 +346,8 @@ tracker_id_pattern() {
     echo "$_TRACKER_ID_PATTERN_CACHE"
     return 0
   fi
-  _tracker_load_config_lib
   local p
-  p=$(config_get_or '.tracker.id_pattern' '^(#[0-9]+|GH-[0-9]+|[A-Z]{2,10}-[0-9]+)$' 2>/dev/null)
+  p=$(_tracker_config_get_or '.tracker.id_pattern' '^(#[0-9]+|GH-[0-9]+|[A-Z]{2,10}-[0-9]+)$' 2>/dev/null)
   if [ -z "$p" ] || [ "$p" = "null" ]; then
     p='^(#[0-9]+|GH-[0-9]+|[A-Z]{2,10}-[0-9]+)$'
   fi
@@ -208,7 +363,7 @@ tracker_id_pattern() {
 # ------------------------------------------------------------------------------
 _TRACKER_VIEW_TPL_CACHE=""
 _tracker_view_template() {
-  local repo="${1:-}"
+  local repo="${1:-}" kind="${2:-}"
   if [ -n "$repo" ]; then
     local pv
     if pv=$(_tracker_project_value "$repo" view_command) && [ -n "$pv" ]; then
@@ -220,11 +375,22 @@ _tracker_view_template() {
     echo "$_TRACKER_VIEW_TPL_CACHE"
     return 0
   fi
-  _tracker_load_config_lib
   local tpl
-  tpl=$(config_get_or '.tracker.view_command' 'gh issue view {id} --repo {owner_repo} --json state,title,url,labels' 2>/dev/null)
+  # An explicit .tracker.view_command (registry per-project or config) always
+  # wins. With none set, fall back to a per-KIND built-in default: glab gets a
+  # first-class GitLab command (parity with _tracker_create_glab, #755); every
+  # other kind gets the gh shape. linear/jira/asana adopters still supply their
+  # own view_command (unchanged contract) — they only land on the gh default if
+  # they forgot to set one. The default view_command is deliberately NOT pinned
+  # in project-config.defaults.json, so this kind-aware fallback can fire (a
+  # pinned default would deep-merge over a glab adopter's `kind: glab` and force
+  # the gh command — the exact #755 bug at the config layer).
+  tpl=$(_tracker_config_get_or '.tracker.view_command' '' 2>/dev/null)
   if [ -z "$tpl" ] || [ "$tpl" = "null" ]; then
-    tpl='gh issue view {id} --repo {owner_repo} --json state,title,url,labels'
+    case "$kind" in
+      glab) tpl='glab issue view {id} -R {owner_repo} --output json' ;;
+      *)    tpl='gh issue view {id} --repo {owner_repo} --json state,title,url,labels,body' ;;
+    esac
   fi
   if [ -z "$repo" ]; then
     _TRACKER_VIEW_TPL_CACHE="$tpl"
@@ -247,12 +413,25 @@ tracker_owner_repo_param() {
 
 # ------------------------------------------------------------------------------
 # Internal: substitute {id} and {owner_repo} placeholders in the view template.
+#
+# The substituted string is run via `eval` in tracker_view, so the {id} /
+# {owner_repo} values must not be able to inject command syntax. Both are
+# shell-quoted with `printf %q` before substitution — a no-op for legitimate
+# ticket IDs / owner-repo slugs, and a neutraliser for anything containing shell
+# metacharacters. This is defence-in-depth behind each caller's own shape check:
+# validate-pr-create.sh / require-migration-ticket.sh validate before calling in,
+# but quoting here guarantees a future caller that forwards unvalidated input into
+# tracker_view can't reopen the injection hole. (#755 security review — Rex/Hakim.)
 # ------------------------------------------------------------------------------
 _tracker_substitute() {
   local tpl="$1" id="$2" owner_repo="$3"
+  local q_id q_owner_repo
+  # printf -v is available in bash 3.2 (macOS default); %q shell-escapes.
+  printf -v q_id '%q' "$id"
+  printf -v q_owner_repo '%q' "$owner_repo"
   # Use POSIX parameter expansion — portable across bash 3.2 (macOS default).
-  tpl="${tpl//\{id\}/$id}"
-  tpl="${tpl//\{owner_repo\}/$owner_repo}"
+  tpl="${tpl//\{id\}/$q_id}"
+  tpl="${tpl//\{owner_repo\}/$q_owner_repo}"
   echo "$tpl"
 }
 
@@ -260,8 +439,8 @@ _tracker_substitute() {
 # Internal adapter: gh → normalised JSON.
 #
 # Reads `gh issue view` JSON. The default view_command requests state, title,
-# url, labels — labels comes back as an array of objects with .name keys, so
-# we flatten to a string array.
+# url, labels, body — labels comes back as an array of objects with .name keys,
+# so we flatten to a string array; body is passed through verbatim.
 # ------------------------------------------------------------------------------
 _tracker_normalise_gh() {
   local raw="$1"
@@ -276,7 +455,32 @@ _tracker_normalise_gh() {
     state:  (.state // ""),
     title:  (.title // ""),
     url:    (.url // ""),
-    labels: ((.labels // []) | map(if type == "object" then .name else . end))
+    labels: ((.labels // []) | map(if type == "object" then .name else . end)),
+    body:   (.body // "")
+  }' 2>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# Internal adapter: glab (GitLab) → normalised JSON.
+#
+# `glab issue view <id> -R <repo> --output json` emits the GitLab REST issue
+# object: .state is "opened"/"closed", .web_url is the URL, .description is the
+# body, and .labels is already an array of strings. State is normalised to
+# OPEN/CLOSED for contract parity with the gh adapter (downstream closed-state
+# classification is case-insensitive, so either casing works — parity is for
+# consumers that read .state directly). glab is a first-class view kind
+# alongside gh, mirroring the existing _tracker_create_glab creation adapter.
+# ------------------------------------------------------------------------------
+_tracker_normalise_glab() {
+  local raw="$1"
+  if [ -z "$raw" ]; then return 1; fi
+  if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then return 1; fi
+  printf '%s' "$raw" | jq -c '{
+    state:  ((.state // "") | if . == "opened" then "OPEN" elif . == "closed" then "CLOSED" else (. | ascii_upcase) end),
+    title:  (.title // ""),
+    url:    (.web_url // .url // ""),
+    labels: ((.labels // []) | map(if type == "object" then .name else . end)),
+    body:   (.description // .body // "")
   }' 2>/dev/null
 }
 
@@ -285,8 +489,10 @@ _tracker_normalise_gh() {
 #
 # Documented assumption: `linear issue view <ID> --json` emits a JSON object
 # with .state (or .state.name), .title, .url, .labels (array of strings or
-# array of {name} objects). Both shapes are handled — older linear CLI
-# versions returned strings; newer return objects.
+# array of {name} objects), and .description (a markdown string). Both label
+# shapes are handled — older linear CLI versions returned strings; newer return
+# objects. body maps to .description so the migration gate can read the linked
+# AgDR (#761).
 # ------------------------------------------------------------------------------
 _tracker_normalise_linear() {
   local raw="$1"
@@ -296,7 +502,8 @@ _tracker_normalise_linear() {
     state:  ((.state | if type == "object" then .name else . end) // ""),
     title:  (.title // ""),
     url:    (.url // ""),
-    labels: ((.labels // []) | map(if type == "object" then .name else . end))
+    labels: ((.labels // []) | map(if type == "object" then .name else . end)),
+    body:   (.description // "")
   }' 2>/dev/null
 }
 
@@ -304,8 +511,18 @@ _tracker_normalise_linear() {
 # Internal adapter: jira → normalised JSON.
 #
 # Documented assumption: `jira issue view <ID> --raw` emits Jira's REST JSON
-# with .fields.{summary,status.name,labels} and .self for the URL. The
-# `jira` CLI (ankitpokhrel/jira-cli) is the de-facto standard.
+# with .fields.{summary,status.name,labels,description} and .self for the URL.
+# The `jira` CLI (ankitpokhrel/jira-cli) is the de-facto standard.
+#
+# body maps to .fields.description (#761). Jira Cloud returns the description as
+# ADF — Atlassian Document Format, a JSON object ({type:"doc",content:[…]}), not
+# a string — so a naive pass-through would emit an unusable object and the
+# migration gate could never grep an AgDR link out of it. The `if type` branch
+# below flattens ADF: it recursively collects every `text` leaf from the content
+# tree (`[.. | .text? // empty]`) and joins them with newlines, yielding
+# grep-able plain text. Jira Server / Data Center returns description as a plain
+# string, which the string branch passes through verbatim. A missing/null
+# description degrades to "".
 # ------------------------------------------------------------------------------
 _tracker_normalise_jira() {
   local raw="$1"
@@ -315,7 +532,13 @@ _tracker_normalise_jira() {
     state:  ((.fields.status.name // .status // "") | tostring),
     title:  ((.fields.summary // .summary // .title // "") | tostring),
     url:    ((.self // .url // "") | tostring),
-    labels: ((.fields.labels // .labels // []) | map(if type == "object" then .name else . end))
+    labels: ((.fields.labels // .labels // []) | map(if type == "object" then .name else . end)),
+    body:   (
+      (.fields.description // .description // "") as $d |
+      if ($d | type) == "string" then $d
+      elif ($d | type) == "object" then ([$d | .. | .text? // empty] | join("\n"))
+      else "" end
+    )
   }' 2>/dev/null
 }
 
@@ -323,8 +546,10 @@ _tracker_normalise_jira() {
 # Internal adapter: asana → normalised JSON.
 #
 # Documented assumption: `asana task get <gid> --json` emits {data: {name,
-# completed, permalink_url, tags}}. State is derived from .completed
-# (true → "Closed", false → "Open").
+# completed, permalink_url, tags, notes}}. State is derived from .completed
+# (true → "Closed", false → "Open"). body maps to .notes (Asana's plain-text
+# task description), falling back to .html_notes when only the rich-text form is
+# present, so the migration gate can read the linked AgDR (#761).
 # ------------------------------------------------------------------------------
 _tracker_normalise_asana() {
   local raw="$1"
@@ -336,7 +561,8 @@ _tracker_normalise_asana() {
       state:  (if ($t.completed == true) then "Closed" else "Open" end),
       title:  ($t.name // ""),
       url:    ($t.permalink_url // ""),
-      labels: (($t.tags // []) | map(if type == "object" then .name else . end))
+      labels: (($t.tags // []) | map(if type == "object" then .name else . end)),
+      body:   ($t.notes // $t.html_notes // "")
     }
   ' 2>/dev/null
 }
@@ -354,9 +580,8 @@ _tracker_normalise_custom() {
   if [ -z "$raw" ]; then return 1; fi
   if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then return 1; fi
 
-  _tracker_load_config_lib
   local jq_expr
-  jq_expr=$(config_get_or '.tracker.normalise_jq' '.' 2>/dev/null)
+  jq_expr=$(_tracker_config_get_or '.tracker.normalise_jq' '.' 2>/dev/null)
   if [ -z "$jq_expr" ] || [ "$jq_expr" = "null" ]; then
     jq_expr='.'
   fi
@@ -383,7 +608,7 @@ tracker_view() {
   # and view_command come from that project's registry override (if any),
   # falling back to the global config block. See AgDR-0072 / #670.
   local kind
-  kind=$(tracker_kind "$owner_repo")
+  kind=$(tracker_issue_kind "$owner_repo")
 
   case "$kind" in
     none)
@@ -399,12 +624,13 @@ tracker_view() {
   fi
 
   local tpl cmd raw rc
-  tpl=$(_tracker_view_template "$owner_repo")
+  tpl=$(_tracker_view_template "$owner_repo" "$kind")
   cmd=$(_tracker_substitute "$tpl" "$id" "$owner_repo")
 
-  # Run the command; capture stdout. Suppress stderr (CLI errors are visible
-  # via exit code and absence-of-output).
-  raw=$(eval "$cmd" 2>/dev/null)
+  # Capture stdout. Stderr passes through so the operator sees the real cause
+  # (#1332). Callers that treat a missing ticket as expected still wrap this
+  # call in 2>/dev/null.
+  raw=$(eval "$cmd")
   rc=$?
   if [ $rc -ne 0 ] || [ -z "$raw" ]; then
     return 1
@@ -413,6 +639,7 @@ tracker_view() {
   local normalised
   case "$kind" in
     gh)     normalised=$(_tracker_normalise_gh "$raw") ;;
+    glab)   normalised=$(_tracker_normalise_glab "$raw") ;;
     linear) normalised=$(_tracker_normalise_linear "$raw") ;;
     jira)   normalised=$(_tracker_normalise_jira "$raw") ;;
     asana)  normalised=$(_tracker_normalise_asana "$raw") ;;
@@ -470,12 +697,56 @@ tracker_state() {
 # dedicated extractor in their own adapter (Part C), not this numeric helper.
 _tracker_extract_ref_url() {
   local raw="$1" url ref
-  url=$(printf '%s\n' "$raw" | grep -oE 'https?://[^[:space:]]+' | grep -E '/issues/[0-9]+' | head -1)
+  # Match both the legacy `/-/issues/N` form and GitLab's current
+  # `/-/work_items/N` issue URL shape (me2resh/apexyard#955) — a glab adopter
+  # whose `glab issue create` prints the work_items form would otherwise get
+  # an empty parse and a false "creation failed". The trailing-numeric ref
+  # extraction below already handles both.
+  url=$(printf '%s\n' "$raw" | grep -oE 'https?://[^[:space:]]+' | grep -E '/(issues|work_items)/[0-9]+' | head -1)
   if [ -z "$url" ]; then
     return 1
   fi
   ref=$(printf '%s' "$url" | grep -oE '[0-9]+$')
   jq -nc --arg ref "$ref" --arg url "$url" '{ref:$ref, url:$url}' 2>/dev/null
+}
+
+_tracker_check_private_refs() {
+  local repo="$1" title="${2:-}" body_file="${3:-}"
+  local tracker_lib_dir="" root pin_file pinned_root
+
+  # A review is often submitted from workspace/<project>, whose git root is
+  # the managed project clone rather than the ops fork that owns this scanner.
+  # Under zsh, BASH_SOURCE is unavailable as well, so the old git-root fallback
+  # selected the project clone and failed closed even though the scanner was
+  # present in the pinned ops fork. Prefer the explicit adapter override and
+  # the session pin before any shell-local or cwd-derived fallback.
+  if [ -n "${APEXYARD_OPS_ROOT:-}" ] && [ -d "$APEXYARD_OPS_ROOT/.claude/hooks" ]; then
+    tracker_lib_dir="$APEXYARD_OPS_ROOT/.claude/hooks"
+  fi
+  if [ -z "$tracker_lib_dir" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    pin_file="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID}"
+    if [ -f "$pin_file" ]; then
+      IFS= read -r pinned_root < "$pin_file" || pinned_root=""
+      if [ -n "$pinned_root" ] && [ -d "$pinned_root/.claude/hooks" ]; then
+        tracker_lib_dir="$pinned_root/.claude/hooks"
+      fi
+    fi
+  fi
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    tracker_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd) || tracker_lib_dir=""
+  fi
+  if [ -z "$tracker_lib_dir" ] || [ ! -f "$tracker_lib_dir/check-private-refs-runtime.sh" ]; then
+    root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -n "$root" ] && { [ -f "$root/.apexyard-fork" ] || { [ -f "$root/onboarding.yaml" ] && [ -f "$root/apexyard.projects.yaml" ]; }; }; then
+      tracker_lib_dir="$root/.claude/hooks"
+    fi
+  fi
+  local scanner="$tracker_lib_dir/check-private-refs-runtime.sh"
+  if [ ! -x "$scanner" ]; then
+    echo "BLOCKED: private-reference runtime scanner is missing or not executable." >&2
+    return 2
+  fi
+  "$scanner" "$repo" "$title" "$body_file"
 }
 
 # Internal adapter: gh → run `gh issue create` with safe arg passing.
@@ -493,7 +764,9 @@ _tracker_create_gh() {
       [ -n "$l" ] && args+=(--label "$l")
     done
   fi
-  gh "${args[@]}" 2>/dev/null
+  # stderr passes through so the operator sees the real cause (#1327).
+  # Callers capture stdout only; the issue URL is on stdout.
+  gh "${args[@]}"
 }
 
 # Internal adapter: glab (GitLab) → `glab issue create`. GitLab's CLI has no
@@ -511,7 +784,7 @@ _tracker_create_glab() {
     args+=(--label "$labels")
   fi
   args+=(--yes)
-  glab "${args[@]}" 2>/dev/null
+  glab "${args[@]}"
 }
 
 # Internal: resolve the create_command template for the `custom` kind — the
@@ -526,9 +799,8 @@ _tracker_create_template() {
       return 0
     fi
   fi
-  _tracker_load_config_lib
   local tpl
-  tpl=$(config_get_or '.tracker.create_command' '' 2>/dev/null)
+  tpl=$(_tracker_config_get_or '.tracker.create_command' '' 2>/dev/null)
   if [ -n "$tpl" ] && [ "$tpl" != "null" ]; then
     echo "$tpl"
   fi
@@ -560,7 +832,7 @@ _tracker_create_custom() {
   local cmd="$tpl"
   cmd="${cmd//\{owner_repo\}/$repo}"
   TRACKER_REPO="$repo" TRACKER_TITLE="$title" TRACKER_BODY_FILE="$body_file" TRACKER_LABELS="$labels" \
-    eval "$cmd" 2>/dev/null
+    eval "$cmd"
 }
 
 # Public: tracker_create <owner/repo> <title> [<body_file>] [<labels_csv>]
@@ -574,7 +846,7 @@ tracker_create() {
   fi
 
   local kind
-  kind=$(tracker_kind "$repo")
+  kind=$(tracker_issue_kind "$repo")
   case "$kind" in
     none)
       # Shape-only mode (tracker.kind=none): no tracker CLI to call. Emit the
@@ -587,6 +859,8 @@ tracker_create() {
       return 3
       ;;
   esac
+
+  _tracker_check_private_refs "$repo" "$title" "$body_file" || return $?
 
   local raw rc
   case "$kind" in
@@ -605,6 +879,413 @@ tracker_create() {
     return 1
   fi
   echo "$result"
+}
+
+# ==============================================================================
+# Listing (tracker_list) — the #710 / AgDR-0093 read/triage abstraction.
+#
+# tracker_list is the listing analog of tracker_view: it lists a SET of issues
+# from a project's tracker via that tracker's CLI adapter. The read-side skills
+# (/inbox, /tasks, /stakeholder-update) call it instead of hardcoding
+# `gh issue list`, so they work on GitLab-tracked projects too.
+#
+# Design (AgDR-0093): callers express intent in a small GENERIC filter
+# vocabulary; each per-kind adapter renders those generic filters into its own
+# native CLI flags. We do NOT parse GitHub's search string and translate it —
+# that would couple the model to GitHub's DSL. Filters with no cross-tracker
+# equivalent (mentions:, commenter:) stay OUT of this model; skills that want
+# them keep a gh-only path (documented) or filter client-side.
+#
+# Contract: tracker_list <owner/repo> [key=value ...]
+#   Filter keys (all optional): state | assignee | author | labels | search |
+#                               since | limit
+#     state    = open (default) | closed | all
+#     assignee = @me | none | <user>   (none: gh via no:assignee; glab degrades)
+#     author   = @me | <user>
+#     labels   = comma-separated (AND semantics, per each CLI's native behaviour)
+#     search   = free text
+#     since    = ISO date (gh: search qualifier; others: client-side updatedAt)
+#     limit    = max items
+#   On success: emits a JSON ARRAY on stdout, exit 0. Each element:
+#     {"ref":str, "number":num, "state":str, "title":str, "url":str,
+#      "labels":[str], "updatedAt":str}
+#     - ref is the issue reference AS A STRING (callers must not do arithmetic —
+#       a future tracker may key LIN-42). number is the numeric convenience.
+#     - PR-only fields (mergeable/statusCheckRollup/reviewDecision) are excluded
+#       by design — those are the forge axis (#711), not the issue axis.
+#     - An empty result set is `[]` with exit 0 (success, nothing matched).
+#   On failure (CLI missing/errored, kind=none, unparseable): emits `[]` and
+#     exits 1 — callers treat empty output as "nothing / unavailable" uniformly.
+#
+# Filter args are parsed via a `case` statement into plain locals — bash 3.2-safe
+# (no `declare -A`), matching the POSIX-parameter-expansion constraint elsewhere
+# in this file. linear/jira/asana list adapters are a documented follow-up (the
+# #710 parent stack targets GitHub↔GitLab); until then they fall through to the
+# gh best-effort default (consistent with `tracker_view` / `tracker_create`).
+# ------------------------------------------------------------------------------
+
+# Internal: resolve the list_command template for the `custom` kind — the
+# per-project override (registry) wins over a global .tracker.list_command.
+# Empty when neither is set (custom kind without a template can't list).
+_tracker_list_template() {
+  local repo="${1:-}"
+  if [ -n "$repo" ]; then
+    local pv
+    if pv=$(_tracker_project_value "$repo" list_command) && [ -n "$pv" ]; then
+      echo "$pv"
+      return 0
+    fi
+  fi
+  local tpl
+  tpl=$(_tracker_config_get_or '.tracker.list_command' '' 2>/dev/null)
+  if [ -n "$tpl" ] && [ "$tpl" != "null" ]; then
+    echo "$tpl"
+  fi
+}
+
+# Internal adapter: gh → run `gh issue list --json …` with safe argv.
+# Structured filters map to gh's native flags; `assignee=none` and `since` have
+# no dedicated flag, so they append `no:assignee` / `closed:>=`|`updated:>=`
+# qualifiers to the --search string (gh merges --search with the other flags).
+_tracker_list_gh() {
+  local repo="$1" state="$2" assignee="$3" author="$4" labels="$5" search="$6" since="$7" limit="$8"
+  local -a args
+  # Quote the comma-separated field list so shellcheck doesn't read the commas as
+  # array-element separators (SC2054); gh takes it as a single argument either way.
+  args=(issue list --repo "$repo" --json "number,title,url,labels,state,updatedAt")
+  case "$state" in
+    open|closed|all) args+=(--state "$state") ;;
+    *)               args+=(--state open) ;;
+  esac
+  if [ -n "$assignee" ]; then
+    case "$assignee" in
+      none) search="${search:+$search }no:assignee" ;;
+      *)    args+=(--assignee "$assignee") ;;
+    esac
+  fi
+  [ -n "$author" ] && args+=(--author "$author")
+  [ -n "$labels" ] && args+=(--label "$labels")
+  if [ -n "$since" ]; then
+    if [ "$state" = "closed" ]; then
+      search="${search:+$search }closed:>=$since"
+    else
+      search="${search:+$search }updated:>=$since"
+    fi
+  fi
+  [ -n "$search" ] && args+=(--search "$search")
+  [ -n "$limit" ]  && args+=(--limit "$limit")
+  # stderr passes through so the operator sees the real cause (#1332).
+  gh "${args[@]}"
+}
+
+# Internal adapter: glab (GitLab) → `glab issue list -O json`. Flags verified
+# against `glab issue list --help`: --assignee/--author/--label(repeatable)/
+# --search+--in/--opened|--closed|--all/--per-page. `assignee=none` has no clean
+# glab flag → degrades (dropped); `since` is applied CLIENT-SIDE by tracker_list.
+_tracker_list_glab() {
+  local repo="$1" state="$2" assignee="$3" author="$4" labels="$5" search="$6" since="$7" limit="$8"
+  local -a args
+  args=(issue list -R "$repo" -O json)
+  case "$state" in
+    closed) args+=(--closed) ;;
+    all)    args+=(--all) ;;
+    *)      args+=(--opened) ;;
+  esac
+  if [ -n "$assignee" ]; then
+    case "$assignee" in
+      none) : ;;  # no clean glab flag — documented degradation (AgDR-0093)
+      *)    args+=(--assignee "$assignee") ;;
+    esac
+  fi
+  [ -n "$author" ] && args+=(--author "$author")
+  if [ -n "$labels" ]; then
+    local l
+    local IFS=','
+    for l in $labels; do
+      [ -n "$l" ] && args+=(--label "$l")
+    done
+  fi
+  if [ -n "$search" ]; then
+    args+=(--search "$search" --in "title,description")
+  fi
+  [ -n "$limit" ] && args+=(--per-page "$limit")
+  # stderr passes through so the operator sees the real cause (#1332).
+  glab "${args[@]}"
+}
+
+# Internal adapter: custom → operator-supplied list_command template. Same trust
+# model as create: only {owner_repo} is substituted into the eval'd string; the
+# filter values pass via ENV ($TRACKER_STATE / $TRACKER_ASSIGNEE / … ) that the
+# operator references with quoted expansions — inert as command syntax. The
+# custom command is expected to emit a JSON array (normalised via identity, or a
+# configured .tracker.list_normalise_jq).
+_tracker_list_custom() {
+  local repo="$1" state="$2" assignee="$3" author="$4" labels="$5" search="$6" since="$7" limit="$8"
+  local tpl
+  tpl=$(_tracker_list_template "$repo")
+  if [ -z "$tpl" ]; then
+    return 1
+  fi
+  local cmd="$tpl"
+  cmd="${cmd//\{owner_repo\}/$repo}"
+  TRACKER_REPO="$repo" TRACKER_STATE="$state" TRACKER_ASSIGNEE="$assignee" TRACKER_AUTHOR="$author" \
+    TRACKER_LABELS="$labels" TRACKER_SEARCH="$search" TRACKER_SINCE="$since" TRACKER_LIMIT="$limit" \
+    eval "$cmd"
+}
+
+# Internal: normalise a gh `issue list --json` array → common array shape.
+_tracker_normalise_list_gh() {
+  local raw="$1"
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s' "$raw" | jq -c 'map({
+    ref:       (.number | tostring),
+    number:    .number,
+    state:     (.state // ""),
+    title:     (.title // ""),
+    url:       (.url // ""),
+    labels:    ((.labels // []) | map(if type == "object" then .name else . end)),
+    updatedAt: (.updatedAt // "")
+  })' 2>/dev/null
+}
+
+# Internal: normalise a glab `issue list -O json` array → common array shape.
+# GitLab's REST JSON uses iid / web_url / updated_at, and labels as a string
+# array. state is "opened"/"closed" — normalised to that string verbatim.
+_tracker_normalise_list_glab() {
+  local raw="$1"
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s' "$raw" | jq -c 'map({
+    ref:       ((.iid // .id) | tostring),
+    number:    (.iid // .id),
+    state:     (.state // ""),
+    title:     (.title // ""),
+    url:       (.web_url // .url // ""),
+    labels:    ((.labels // []) | map(if type == "object" then .name else . end)),
+    updatedAt: (.updated_at // .updatedAt // "")
+  })' 2>/dev/null
+}
+
+# Internal: normalise a custom list output. The operator's command is expected
+# to emit an already-shaped JSON array; an optional .tracker.list_normalise_jq
+# maps a different raw shape. Default is identity.
+_tracker_normalise_list_custom() {
+  local raw="$1"
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" | jq -e . >/dev/null 2>&1 || return 1
+  local jq_expr
+  jq_expr=$(_tracker_config_get_or '.tracker.list_normalise_jq' '.' 2>/dev/null)
+  if [ -z "$jq_expr" ] || [ "$jq_expr" = "null" ]; then
+    jq_expr='.'
+  fi
+  printf '%s' "$raw" | jq -c "$jq_expr" 2>/dev/null
+}
+
+# Internal: page cap for an already-resolved kind, so a caller that holds the
+# kind does not pay for a second registry read.
+_tracker_page_cap_for_kind() {
+  case "${1:-}" in
+    glab) printf '100\n' ;;
+    *)    printf '0\n' ;;
+  esac
+}
+
+# Public: tracker_page_cap <owner/repo>
+#   Echoes the adapter's maximum page size, or 0 when the adapter has none.
+#   GitLab caps a page at 100 whatever --per-page asks for, so a 100-item glab
+#   result never proves the end of the set.
+tracker_page_cap() {
+  _tracker_page_cap_for_kind "$(tracker_issue_kind "${1:-}")"
+}
+
+# Public: tracker_fetch_status <rc> <count> <limit> [owner/repo] [kind]
+#   Pass `kind` when you already resolved it. The repo argument is then unused,
+#   and no second registry read happens.
+#   COMPLETE  — the read returned fewer items than the effective limit, which
+#               is the only proof that it reached the end of the set.
+#   TRUNCATED — the read filled the limit (or the adapter's page cap). More
+#               items may exist. Raise the limit and read again.
+#   UNKNOWN   — the call failed or the count is unreadable. Never report this
+#               as zero: a failed fetch is not an empty result.
+tracker_fetch_status() {
+  local rc="${1:-1}" count="${2:-}" limit="${3:-0}" repo="${4:-}" kind="${5:-}" cap effective
+  if [ "$rc" != "0" ]; then printf 'UNKNOWN\n'; return 0; fi
+  case "$count" in ''|*[!0-9]*) printf 'UNKNOWN\n'; return 0 ;; esac
+  case "$limit" in ''|*[!0-9]*) printf 'UNKNOWN\n'; return 0 ;; esac
+  # Digits alone are not a number `[` can compare. A value wider than int64
+  # makes `[` write "integer expected" to stderr, so reject it here instead.
+  if [ "${#count}" -gt 18 ] || [ "${#limit}" -gt 18 ]; then printf 'UNKNOWN\n'; return 0; fi
+  effective="$limit"
+  if [ -n "$kind" ]; then
+    cap=$(_tracker_page_cap_for_kind "$kind")
+  else
+    cap=$(tracker_page_cap "$repo")
+  fi
+  if [ "$cap" -gt 0 ] && [ "$cap" -lt "$effective" ]; then effective="$cap"; fi
+  if [ "$effective" -le 0 ]; then printf 'UNKNOWN\n'; return 0; fi
+  if [ "$count" -lt "$effective" ]; then printf 'COMPLETE\n'; else printf 'TRUNCATED\n'; fi
+}
+
+# Public: tracker_list_to <outfile> <owner/repo> [key=value ...]
+#   Writes the JSON array to <outfile> and echoes this call's completeness
+#   verdict on stdout. Use this from a command substitution:
+#
+#     status=$(tracker_list_to "$tmp" "$repo" state=open assignee=@me limit=50)
+#
+#   `tracker_list` reports its verdict through TRACKER_LIST_STATUS, which a
+#   subshell cannot pass back to its caller. So the natural shape,
+#   `items=$(tracker_list …)`, silently reads a stale verdict or none at all,
+#   which is the short-read-reported-as-complete failure this reporting exists
+#   to prevent. This wrapper moves the verdict onto stdout, where a command
+#   substitution does return it.
+#
+#   Returns tracker_list's own exit status.
+tracker_list_to() {
+  local out="${1:-}" rc
+  shift 2>/dev/null || true
+  if [ -z "$out" ]; then
+    printf 'UNKNOWN\n'
+    return 1
+  fi
+  TRACKER_LIST_STATUS="UNKNOWN"
+  tracker_list "$@" > "$out"
+  rc=$?
+  printf '%s\n' "$TRACKER_LIST_STATUS"
+  return $rc
+}
+
+# Public: tracker_list <owner/repo> [key=value ...]
+#   Sets TRACKER_LIST_STATUS to this call's tracker_fetch_status verdict.
+#   The variable does not survive a command substitution. Call this in the
+#   current shell, or use tracker_list_to above.
+tracker_list() {
+  local repo="$1"
+  shift 2>/dev/null || true
+  TRACKER_LIST_STATUS="UNKNOWN"
+  if [ -z "$repo" ]; then
+    printf '[]\n'
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '[]\n'
+    return 1
+  fi
+
+  # Parse key=value filter args into plain locals (bash 3.2-safe).
+  local f_state="" f_assignee="" f_author="" f_labels="" f_search="" f_since="" f_limit=""
+  local kv key val
+  for kv in "$@"; do
+    key="${kv%%=*}"
+    val="${kv#*=}"
+    case "$key" in
+      state)        f_state="$val" ;;
+      assignee)     f_assignee="$val" ;;
+      author)       f_author="$val" ;;
+      labels|label) f_labels="$val" ;;
+      search)       f_search="$val" ;;
+      since)        f_since="$val" ;;
+      limit)        f_limit="$val" ;;
+    esac
+  done
+
+  # Per-project resolution: the target repo selects the project's tracker
+  # override, else the global block (never cwd, never a session marker).
+  local kind
+  kind=$(tracker_issue_kind "$repo")
+  case "$kind" in
+    none)
+      printf '[]\n'
+      return 1
+      ;;
+  esac
+
+  # Pass an explicit limit even when the caller gave none. gh and glab each
+  # apply their own default (30) otherwise, and a caller cannot compute
+  # completeness against a limit it never chose.
+  #
+  # The custom adapter is deliberately excluded. It passes the value through
+  # TRACKER_LIMIT, which was empty for a no-limit call, and an operator's
+  # list_command may read empty as "no limit". Defaulting it would change the
+  # returned set. A custom adapter with no caller limit reports UNKNOWN below.
+  #
+  # The config read runs in a SUBSHELL, because the load leaks out of this
+  # function otherwise. `_tracker_load_config_lib` sources
+  # `_lib-read-config.sh` into its caller's shell and short-circuits on
+  # `command -v config_get_or`. Sourcing it here would leave that definition in
+  # the CALLER's shell, and in every subshell the caller later spawns. A later
+  # `tracker_issue_kind` then short-circuits its own load and keeps reading
+  # through a config reader anchored to wherever the first load happened, so
+  # the kind can resolve wrongly. test_tracker_list.sh's two stderr-passthrough
+  # cases fail exactly this way. A subshell keeps the definition out.
+  case "$kind" in
+    custom) : ;;
+    *)
+      case "$f_limit" in
+        ''|*[!0-9]*)
+          f_limit=$(
+            _tracker_load_config_lib >/dev/null 2>&1 \
+              && config_get_or '.tracker.list_default_limit' '30' 2>/dev/null
+          )
+          case "$f_limit" in ''|*[!0-9]*) f_limit=30 ;; esac
+          [ "${#f_limit}" -gt 6 ] && f_limit=30
+          ;;
+      esac
+      ;;
+  esac
+
+  local raw rc
+  case "$kind" in
+    gh)     raw=$(_tracker_list_gh     "$repo" "$f_state" "$f_assignee" "$f_author" "$f_labels" "$f_search" "$f_since" "$f_limit"); rc=$? ;;
+    glab)   raw=$(_tracker_list_glab   "$repo" "$f_state" "$f_assignee" "$f_author" "$f_labels" "$f_search" "$f_since" "$f_limit"); rc=$? ;;
+    custom) raw=$(_tracker_list_custom "$repo" "$f_state" "$f_assignee" "$f_author" "$f_labels" "$f_search" "$f_since" "$f_limit"); rc=$? ;;
+    *)      raw=$(_tracker_list_gh     "$repo" "$f_state" "$f_assignee" "$f_author" "$f_labels" "$f_search" "$f_since" "$f_limit"); rc=$? ;;  # best-effort default
+  esac
+  if [ $rc -ne 0 ] || [ -z "$raw" ]; then
+    printf '[]\n'
+    return 1
+  fi
+
+  local normalised
+  case "$kind" in
+    gh)     normalised=$(_tracker_normalise_list_gh     "$raw") ;;
+    glab)   normalised=$(_tracker_normalise_list_glab   "$raw") ;;
+    custom) normalised=$(_tracker_normalise_list_custom "$raw") ;;
+    *)      normalised=$(_tracker_normalise_list_gh     "$raw") ;;
+  esac
+  if [ -z "$normalised" ] || [ "$normalised" = "null" ]; then
+    printf '[]\n'
+    return 1
+  fi
+
+  # Completeness is judged on what the SERVER returned, so it is counted here,
+  # before the client-side `since` filter below drops any row.
+  #
+  # Only a raw JSON array is countable. A custom adapter may emit another
+  # shape, which `.tracker.list_normalise_jq` maps, and that expression is free
+  # to select rows (`.items | map(select(...))`). Counting the normalised array
+  # would then count the operator's selection rather than the server page, and
+  # report a full page as COMPLETE. An empty `served` makes the verdict
+  # UNKNOWN, which is the honest answer for a page this library cannot count.
+  local served
+  served=$(printf '%s' "$raw" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
+
+  # Client-side `since` for adapters that don't apply it server-side (glab /
+  # custom). gh already handled it via the search qualifier above. Items with no
+  # `updatedAt` are KEPT (not silently dropped) — recency is unknowable for them,
+  # and hiding an item the user can't date is worse than surfacing it. Only items
+  # with a known, older `updatedAt` are filtered out.
+  if [ -n "$f_since" ] && [ "$kind" != "gh" ]; then
+    normalised=$(printf '%s' "$normalised" | jq -c --arg since "$f_since" \
+      'map(select((.updatedAt // "") == "" or (.updatedAt >= $since)))' 2>/dev/null)
+    [ -z "$normalised" ] && normalised='[]'
+  fi
+
+  # shellcheck disable=SC2034  # read by callers (/inbox, /tasks), not in this file
+  TRACKER_LIST_STATUS=$(tracker_fetch_status 0 "$served" "$f_limit" "$repo" "$kind")
+
+  printf '%s\n' "$normalised"
+  return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -664,12 +1345,509 @@ tracker_label_ensure() {
     return 0
   fi
   local kind
-  kind=$(tracker_kind "$repo")
+  kind=$(tracker_issue_kind "$repo")
   case "$kind" in
     gh)   _tracker_label_ensure_gh   "$repo" "$name" "$color" "$desc" ;;
     glab) _tracker_label_ensure_glab "$repo" "$name" "$color" "$desc" ;;
     *)    : ;;  # jira / linear / asana / custom / none — no-op
   esac
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# PR/MR review submission (#758) — tracker/git-host-agnostic review posting.
+#
+# Mirrors tracker_create's shape: kind-dispatched adapters for gh + glab, a
+# `custom` review_command template, and a `none` no-op. The code-reviewer agent
+# (Rex) / /code-review call tracker_review_submit instead of shelling out to
+# `gh pr review` directly, so a GitLab-hosted adopter's review lands on the MR
+# rather than silently assuming GitHub.
+#
+# ORTHOGONAL to the merge gate. This function only posts the HUMAN-VISIBLE review
+# to the git host. The load-bearing `*-rex.approved` marker is a plain local file
+# (already tracker-agnostic) written separately by the agent — a failed submit
+# here does NOT touch it. See .claude/agents/code-reviewer.md § "Approval marker".
+#
+# Verdict vocabulary (faithful to gh's three verbs): approve | comment |
+# request-changes. This is a thin wrapper — the POLICY of "prefer --comment over
+# --approve on single-account self-review" lives in the agent (which passes
+# `comment`), not here.
+# ------------------------------------------------------------------------------
+
+# Internal adapter: gh → `gh pr review`. Args passed as an array (never an eval'd
+# string) so a body full of shell metacharacters is inert. Stdout and stderr both
+# propagate: the caller needs the host's diagnostic when a review is rejected.
+_tracker_review_gh() {
+  local repo="$1" pr="$2" verdict="$3" body_file="$4"
+  _tracker_check_private_refs "$repo" "" "$body_file" || return $?
+  local -a args
+  args=(pr review "$pr" --repo "$repo")
+  case "$verdict" in
+    approve)         args+=(--approve) ;;
+    request-changes) args+=(--request-changes) ;;
+    comment|*)       args+=(--comment) ;;
+  esac
+  if [ -n "$body_file" ] && [ -f "$body_file" ]; then
+    args+=(--body-file "$body_file")
+  fi
+  gh "${args[@]}"
+}
+
+# Internal adapter: glab (GitLab) → `glab mr approve` / `glab mr note create`.
+#
+# GitLab has NO "request-changes" review state, so that verdict posts the review
+# body as an MR note (the verdict is stated in the body — same shape as gh's
+# --comment happy path). `approve` posts the approval and, when a body is given,
+# adds it as a note too (glab mr approve carries no message). `glab mr note
+# create` is the non-deprecated replacement for the old top-level `glab mr note
+# -m` (GitLab prints a deprecation notice steering to `create`); it is flagged
+# EXPERIMENTAL in glab 1.103.x — verified by CLI surface, not a live MR.
+# Stderr passes through so the operator sees the real cause (#1332).
+_tracker_review_glab() {
+  local repo="$1" pr="$2" verdict="$3" body_file="$4"
+  local body=""
+  [ -n "$body_file" ] && [ -f "$body_file" ] && body="$(cat "$body_file")"
+  case "$verdict" in
+    approve)
+      glab mr approve "$pr" -R "$repo" || return 1
+      if [ -n "$body" ]; then
+        glab mr note create "$pr" -R "$repo" -m "$body" || return 1
+      fi
+      ;;
+    comment|request-changes|*)
+      [ -n "$body" ] || return 1   # a comment/notes verdict needs a body
+      glab mr note create "$pr" -R "$repo" -m "$body" || return 1
+      ;;
+  esac
+}
+
+# Internal: resolve the review_command template for the `custom` kind — the
+# per-project override (registry) wins over a global .tracker.review_command.
+# Empty when neither is set (custom kind without a template can't submit).
+_tracker_review_template() {
+  local repo="${1:-}"
+  if [ -n "$repo" ]; then
+    local pv
+    if pv=$(_tracker_project_value "$repo" review_command) && [ -n "$pv" ]; then
+      echo "$pv"
+      return 0
+    fi
+  fi
+  local tpl
+  tpl=$(_tracker_config_get_or '.tracker.review_command' '' 2>/dev/null)
+  if [ -n "$tpl" ] && [ "$tpl" != "null" ]; then
+    echo "$tpl"
+  fi
+}
+
+# Internal adapter: custom → operator-supplied review_command template.
+#
+# Injection model (identical to _tracker_create_custom): only the SAFE
+# placeholders — {owner_repo} (registry slug), {pr} (numeric), {verdict}
+# (validated enum) — are substituted into the eval'd template. The one arbitrary,
+# untrusted value (the review body) is exposed as an ENVIRONMENT VARIABLE
+# ($TRACKER_REVIEW_BODY_FILE, a path) that the operator references with a
+# double-quoted expansion — so a body full of `; rm -rf …` is inert.
+_tracker_review_custom() {
+  local repo="$1" pr="$2" verdict="$3" body_file="$4"
+  local tpl
+  tpl=$(_tracker_review_template "$repo")
+  if [ -z "$tpl" ]; then
+    return 1
+  fi
+  local cmd="$tpl"
+  cmd="${cmd//\{owner_repo\}/$repo}"
+  cmd="${cmd//\{pr\}/$pr}"
+  cmd="${cmd//\{verdict\}/$verdict}"
+  TRACKER_REPO="$repo" TRACKER_PR="$pr" TRACKER_VERDICT="$verdict" \
+    TRACKER_REVIEW_BODY_FILE="$body_file" \
+    eval "$cmd"
+}
+
+# Public: tracker_review_submit <owner/repo> <pr> <verdict> [<body_file>]
+#
+# Review operations resolve `tracker.review_kind`. For backward compatibility,
+# that axis falls back to `tracker.kind` when `review_kind` is absent. This lets
+# Jira/Linear/Asana issue adopters select `glab` for code reviews without a
+# custom review command.
+tracker_review_submit() {
+  local repo="$1" pr="$2" verdict="${3:-comment}" body_file="${4:-}"
+  if [ -z "$repo" ] || [ -z "$pr" ]; then
+    return 1
+  fi
+  # {pr} is documented numeric and is substituted into the custom adapter's
+  # eval'd template — reject a non-numeric value as defense-in-depth (gh/glab
+  # require numeric PR/MR ids anyway).
+  case "$pr" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$verdict" in
+    approve|comment|request-changes) ;;
+    *) verdict="comment" ;;   # normalise anything unexpected to the safe default
+  esac
+
+  local kind
+  kind=$(tracker_review_kind "$repo")
+  [ "$kind" = "none" ] || _tracker_check_private_refs "$repo" "" "$body_file" || return $?
+  case "$kind" in
+    none)
+      # Shape-only mode: no git-host CLI to call. Emit the review body (if given)
+      # so the operator can post it manually, and return 3 (documented
+      # "shape-only" code) so callers don't misreport it as a CLI/auth error.
+      if [ -n "$body_file" ] && [ -f "$body_file" ]; then
+        cat "$body_file"
+      fi
+      return 3
+      ;;
+    gh)     _tracker_review_gh     "$repo" "$pr" "$verdict" "$body_file" ;;
+    glab)   _tracker_review_glab   "$repo" "$pr" "$verdict" "$body_file" ;;
+    custom) _tracker_review_custom "$repo" "$pr" "$verdict" "$body_file" ;;
+    *)      _tracker_review_gh     "$repo" "$pr" "$verdict" "$body_file" ;;  # see NOTE above
+  esac
+}
+
+# ==============================================================================
+# Public: tracker_review_at_sha <owner/repo> <pr> <sha>
+#
+# Answers "was a review actually POSTED to this PR at this exact commit?" —
+# the server-side counterpart to the local *-rex.approved marker file.
+#
+# WHY THIS EXISTS (me2resh/apexyard#1051). The merge gate's evidence that a code
+# review happened is a local file an agent can write.
+#
+# WHAT THIS IS NOT. AgDR-0062 deferred a STRONGER control — a review at HEAD by
+# an INDEPENDENT reviewer (not the PR author) — as unsatisfiable single-account.
+# That objection stands; this is a deliberately weaker check that drops the
+# independence requirement, which is exactly why it IS satisfiable. It does not
+# provide separation of duties and must not be described as if it did. What it
+# proves is narrow and real: a review exists ON THE FORGE at this commit, which
+# a local file write cannot fabricate. See AgDR-0112.
+#
+# It works because GitHub refuses only self-APPROVAL; a COMMENTED review from
+# the PR's own author is accepted and returned with a commit_id (verified on a
+# live same-account PR). Since #587/AgDR-0075 the canonical reviewer flow
+# already posts exactly that shape, so this costs adopters nothing new.
+#
+# Exit codes are deliberately four-way so the caller can fail closed on
+# "couldn't check" without conflating it with "checked, nothing there":
+#
+#   0 — a review exists at <sha>
+#   1 — query succeeded; NO review at <sha>            → caller should block
+#   2 — query FAILED (network / auth / CLI missing)    → caller should block
+#                                                        (fail-closed, AgDR-0104)
+#   3 — this forge cannot be verified (see below)      → caller should SKIP
+#
+# FORGE SUPPORT is honestly narrow. Only `gh` is implemented. GitLab exposes MR
+# approvals and diff versions rather than SHA-stamped review submissions, and
+# mapping those onto "a review at this commit" correctly needs a live GitLab MR
+# to verify against — building it blind would be the kind of unverified claim
+# this framework has been burned by. glab/custom/none therefore return 3 and the
+# caller skips with a visible warning, rather than bricking those adopters.
+tracker_review_at_sha() {
+  local repo="$1" pr="$2" sha="$3"
+  [ -n "$repo" ] && [ -n "$pr" ] && [ -n "$sha" ] || return 2
+  case "$pr" in ''|*[!0-9]*) return 2 ;; esac
+  # `sha` is interpolated into a jq string literal below. Today's only caller
+  # passes a forge-derived SHA, but this is a public function of a CONTROL
+  # library: a crafted value containing a quote could close the literal and
+  # alter the filter into one that always matches — a fail-OPEN. Validate the
+  # shape here rather than trusting every future caller. (`pr` is already
+  # validated numerically one line up; this closes the same class one argument
+  # over.) 7-40 hex chars covers both abbreviated and full SHAs.
+  case "$sha" in
+    *[!0-9a-fA-F]*) return 2 ;;
+  esac
+  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ] || return 2
+  # `repo` reaches a URL path. This rejects path traversal and whitespace; it
+  # does NOT fully validate owner/name shape (gh itself rejects a malformed
+  # slug, and over-tightening here would break legitimate org names). Stated
+  # precisely so nobody reads it as more than it is.
+  case "$repo" in
+    */../*|*/..|../*|*' '*) return 2 ;;
+  esac
+
+  local kind
+  kind=$(tracker_review_kind "$repo")
+  case "$kind" in
+    gh) : ;;
+    *)  return 3 ;;   # not verifiable on this forge — see FORGE SUPPORT above
+  esac
+
+  command -v gh >/dev/null 2>&1 || return 2
+
+  local out rc
+  # `.commit_id` is the commit the review was submitted against. Any review
+  # state counts (COMMENTED / APPROVED / CHANGES_REQUESTED) — the verdict lives
+  # in the body per AgDR-0075, and requiring APPROVED specifically is the exact
+  # single-account trap AgDR-0062 hit.
+  out=$(gh api "repos/${repo}/pulls/${pr}/reviews" --paginate \
+          --jq ".[] | select(.commit_id == \"${sha}\") | .id" 2>/dev/null)
+  rc=$?
+  [ "$rc" -ne 0 ] && return 2
+  [ -n "$out" ] && return 0
+  return 1
+}
+
+# ==============================================================================
+# Merge (tracker_pr_merge) — the #711/#759 merge-command abstraction.
+#
+# `/approve-merge`'s final step used to shell out to a literal `gh pr merge <pr>
+# --squash --delete-branch`. On a GitLab-hosted project there is no `gh`, so the
+# CEO-approval marker could be written but the merge itself had to happen
+# outside the skill (and outside the mechanical gates it's meant to run
+# through). tracker_pr_merge closes that gap the same way #758's
+# tracker_review_submit closed it for review *submission* — a kind-dispatched
+# function (gh/glab/custom/none), never a re-derived inline command.
+#
+# ORTHOGONAL to the merge-*gate* hooks (block-unreviewed-merge.sh,
+# block-merge-on-red-ci.sh, require-design-review-for-ui.sh,
+# require-architecture-review.sh). Those already fire on both the `gh pr merge`
+# and `glab mr merge`/`glab api .../merge` shapes (#764/#767/#793) — this
+# function is what /approve-merge calls AFTER the gates have already had their
+# chance to block the command. Nothing here weakens or bypasses them; the
+# actual `gh`/`glab` command this function shells out to is the exact same
+# command text the gates already recognise.
+#
+# strategy is one of squash|merge|rebase — normalised BEFORE it ever reaches an
+# eval'd string (unlike the review body, there is no free-text value here at
+# all: strategy and delete_branch are both closed enums, so a hostile input is
+# neutralised by the normalisation step itself, not by env-indirection).
+# ------------------------------------------------------------------------------
+
+# Internal: normalise an arbitrary strategy string to squash|merge|rebase,
+# defaulting to squash (today's /approve-merge default) for anything else.
+_tracker_merge_normalise_strategy() {
+  case "${1:-}" in
+    squash|merge|rebase) echo "$1" ;;
+    *) echo "squash" ;;
+  esac
+}
+
+# Internal: normalise an arbitrary delete-branch flag to true|false, defaulting
+# to true (today's /approve-merge default — it always passes --delete-branch).
+_tracker_merge_normalise_delete_branch() {
+  case "${1:-true}" in
+    false|False|FALSE|0|no|No) echo "false" ;;
+    *) echo "true" ;;
+  esac
+}
+
+# Internal adapter: gh → `gh pr merge`. Flags built as an array (never an
+# eval'd string), so the PR/repo/strategy values can't be mistaken for shell
+# syntax even though they're already-validated enums/numerics.
+#
+# Stdout is discarded (`>/dev/null`), stderr is NOT: `gh pr merge` prints a
+# human-readable confirmation line to stdout on success ("✓ Squashed and
+# merged pull request #42 …") — if that reached tracker_pr_merge's own
+# stdout uncaught, it would land BEFORE the `{"sha":...}` JSON the public
+# function returns, breaking every caller's `jq -r '.sha'` parse. We don't
+# need that confirmation text (the SHA is independently resolved via a
+# follow-up `gh pr view` in _tracker_merge_resolve_sha), so it's discarded;
+# gh's error output on FAILURE goes to stderr, which is left to propagate so
+# the operator actually sees why a merge failed (matching the documented
+# contract in `/approve-merge`'s SKILL.md — the failure message the operator
+# sees is meant to be the CLI's own, not silently swallowed).
+#
+# subject/body_file (#1136, AgDR-0132): OPTIONAL, empty by default. Each
+# non-empty value appends its own `--subject "$subject"` or `--body-file
+# "$body_file"` flag so the squash commit preserves the supplied field instead
+# of GitHub's repo-default squash body (which, under
+# `squash_merge_commit_message=COMMIT_MESSAGES`, concatenates every commit
+# message on the PR branch — see #1136). `$subject` and `$body_file` are
+# passed as separate argv array elements (never interpolated into an eval'd
+# string), so neither can be mistaken for a flag or shell syntax.
+_tracker_merge_gh() {
+  local repo="$1" pr="$2" strategy="$3" delete_branch="$4" subject="${5:-}" body_file="${6:-}"
+  _tracker_check_private_refs "$repo" "$subject" "$body_file" || return $?
+  local -a args
+  args=(pr merge "$pr" --repo "$repo")
+  case "$strategy" in
+    squash) args+=(--squash) ;;
+    merge)  args+=(--merge)  ;;
+    rebase) args+=(--rebase) ;;
+  esac
+  [ "$delete_branch" = "true" ] && args+=(--delete-branch)
+  # #1136 / Rex H1: append each flag on its OWN condition. Requiring both
+  # silently dropped a readable body_file whenever subject was empty, which
+  # reintroduced the bare-squash bug this parameter exists to close. gh takes
+  # --subject and --body-file independently; when only --body-file is given,
+  # gh defaults the subject itself.
+  [ -n "$subject" ] && args+=(--subject "$subject")
+  [ -n "$body_file" ] && args+=(--body-file "$body_file")
+  gh "${args[@]}" >/dev/null
+}
+
+# Internal adapter: glab (GitLab) → `glab mr merge`. glab's default merge (no
+# --squash/--rebase flag) IS a plain merge commit, so strategy=merge passes no
+# extra flag — the nearest glab equivalent of gh's --merge. --remove-source-
+# branch is glab's --delete-branch analog. --yes skips the interactive prompt
+# (matches the --yes convention already used by _tracker_create_glab /
+# _tracker_label_ensure_glab).
+#
+# Same stdout/stderr split as _tracker_merge_gh above: stdout discarded
+# (glab also prints a confirmation line on success), stderr left to
+# propagate so a failure reason is visible.
+_tracker_merge_glab() {
+  local repo="$1" pr="$2" strategy="$3" delete_branch="$4"
+  local -a args
+  args=(mr merge "$pr" -R "$repo")
+  case "$strategy" in
+    squash) args+=(--squash) ;;
+    rebase) args+=(--rebase) ;;
+    merge)  : ;;  # glab's default merge action — no flag needed
+  esac
+  [ "$delete_branch" = "true" ] && args+=(--remove-source-branch)
+  args+=(--yes)
+  glab "${args[@]}" >/dev/null
+}
+
+# Internal: resolve the merge_command template for the `custom` kind — the
+# per-project override (registry) wins over a global .tracker.merge_command.
+# Empty when neither is set (custom kind without a template can't merge).
+_tracker_merge_template() {
+  local repo="${1:-}"
+  if [ -n "$repo" ]; then
+    local pv
+    if pv=$(_tracker_project_value "$repo" merge_command) && [ -n "$pv" ]; then
+      echo "$pv"
+      return 0
+    fi
+  fi
+  local tpl
+  tpl=$(_tracker_config_get_or '.tracker.merge_command' '' 2>/dev/null)
+  if [ -n "$tpl" ] && [ "$tpl" != "null" ]; then
+    echo "$tpl"
+  fi
+}
+
+# Internal adapter: custom → operator-supplied merge_command template.
+#
+# Injection model: this adapter receives only the four validated dispatch
+# values. `pr` is numeric-guarded and `repo` is charset-guarded by the public
+# function below (both checked BEFORE every adapter), while `strategy` and
+# `delete_branch` are normalised to closed enums before this function sees
+# them. So all four placeholders — {owner_repo} (registry slug,
+# charset-guarded), {pr} (numeric-guarded), {strategy} (squash|merge|rebase),
+# {delete_branch} (true|false) — are safe to substitute directly into the
+# eval'd template. `subject` is fork-controlled PR-title text, but dispatch
+# deliberately does not forward it here. Any future forwarding of subject or
+# body content into this eval requires sanitising it before substitution.
+#
+# Stdout discarded, stderr left to propagate — same rationale as
+# _tracker_merge_gh/_tracker_merge_glab above: the operator-supplied CLI's
+# own confirmation text on stdout must not contaminate the `{"sha":...}`
+# JSON the public function returns, but its failure output on stderr should
+# still be visible.
+_tracker_merge_custom() {
+  local repo="$1" pr="$2" strategy="$3" delete_branch="$4"
+  local tpl
+  tpl=$(_tracker_merge_template "$repo")
+  if [ -z "$tpl" ]; then
+    return 1
+  fi
+  local cmd="$tpl"
+  cmd="${cmd//\{owner_repo\}/$repo}"
+  cmd="${cmd//\{pr\}/$pr}"
+  cmd="${cmd//\{strategy\}/$strategy}"
+  cmd="${cmd//\{delete_branch\}/$delete_branch}"
+  TRACKER_REPO="$repo" TRACKER_PR="$pr" TRACKER_STRATEGY="$strategy" \
+    TRACKER_DELETE_BRANCH="$delete_branch" \
+    eval "$cmd" >/dev/null
+}
+
+# Internal: best-effort merge-commit SHA lookup after a successful merge.
+# gh:   `gh pr view --json mergeCommit` → .mergeCommit.oid
+# glab: `glab mr view --output json`    → .merge_commit_sha (fallback
+#       .squash_commit_sha for a squash merge on older glab)
+# custom: no generic way to know the custom CLI's output shape — emits empty.
+# Any failure (CLI missing, network, unparseable) degrades to an empty sha;
+# the merge itself already succeeded by the time this runs, so a SHA-lookup
+# failure must never be reported as a merge failure.
+_tracker_merge_resolve_sha() {
+  local kind="$1" repo="$2" pr="$3" sha=""
+  case "$kind" in
+    gh)
+      sha=$(gh pr view "$pr" --repo "$repo" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null)
+      ;;
+    glab)
+      sha=$(glab mr view "$pr" -R "$repo" --output json 2>/dev/null | jq -r '.merge_commit_sha // .squash_commit_sha // empty' 2>/dev/null)
+      ;;
+    *)
+      sha=""
+      ;;
+  esac
+  jq -nc --arg sha "${sha:-}" '{sha:$sha}' 2>/dev/null
+}
+
+# Public: tracker_pr_merge <owner/repo> <pr> <strategy> [<delete_branch>]
+#
+# Merge operations resolve `tracker.review_kind`, with the legacy `tracker.kind`
+# value as the fallback for existing projects.
+tracker_pr_merge() {
+  local repo="$1" pr="$2" strategy delete_branch subject body_file
+  if [ -z "$repo" ] || [ -z "$pr" ]; then
+    return 1
+  fi
+  # {owner_repo} is substituted into the custom adapter's eval'd template too
+  # (same trust model as tracker_create/tracker_review_submit — a registry-
+  # sourced slug, not free-text). Reject anything outside the safe owner/repo
+  # (or nested-subgroup, e.g. GitLab `group/subgroup/repo`) charset as
+  # defense-in-depth, BEFORE dispatching to any adapter — not just `custom`.
+  # A real owner/repo slug never contains `;`, `|`, `&`, `$`, backticks,
+  # parens, quotes, or whitespace, so this cannot reject a legitimate value.
+  case "$repo" in
+    *[!A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  # {pr} is documented numeric and is substituted into the custom adapter's
+  # eval'd template — reject a non-numeric value as defense-in-depth (gh/glab
+  # require numeric PR/MR ids anyway; matches tracker_review_submit's guard).
+  case "$pr" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  strategy=$(_tracker_merge_normalise_strategy "${3:-}")
+  delete_branch=$(_tracker_merge_normalise_delete_branch "${4:-}")
+  subject="${5:-}"
+  body_file="${6:-}"
+
+  # #1136 fail-safe: a subject/body_file pair is only meaningful together
+  # (gh's `--subject` with no `--body-file` still falls back to the
+  # repo-default squash-body assembly for the body half — the exact bug this
+  # parameter exists to close). If body_file is supplied but unreadable or
+  # empty, refuse the merge rather than silently degrading to a bare squash
+  # that would reintroduce #1136. The guard tests that body_file is a regular,
+  # readable, non-empty file — a directory, a mode-000 file, and a zero-byte
+  # file all refuse here rather than reaching gh. An empty subject with a
+  # body_file is accepted (gh takes --body-file alone and defaults the
+  # subject); the only failing shape is "caller wanted body_file honoured and
+  # it can't be read".
+  if [ -n "$body_file" ] && { [ ! -f "$body_file" ] || [ ! -r "$body_file" ] || [ ! -s "$body_file" ]; }; then
+    return 1
+  fi
+
+  local kind
+  kind=$(tracker_review_kind "$repo")
+  [ "$kind" = "none" ] || _tracker_check_private_refs "$repo" "$subject" "$body_file" || return $?
+  case "$kind" in
+    none)
+      # Shape-only mode: no git-host CLI to call. Nothing to echo (unlike
+      # tracker_create/tracker_review_submit there's no body/artifact to hand
+      # back) — just the documented shape-only exit code.
+      return 3
+      ;;
+  esac
+
+  local rc
+  case "$kind" in
+    gh)     _tracker_merge_gh     "$repo" "$pr" "$strategy" "$delete_branch" "$subject" "$body_file"; rc=$? ;;
+    glab)   _tracker_merge_glab   "$repo" "$pr" "$strategy" "$delete_branch"; rc=$? ;;
+    custom) _tracker_merge_custom "$repo" "$pr" "$strategy" "$delete_branch"; rc=$? ;;
+    *)      _tracker_merge_gh     "$repo" "$pr" "$strategy" "$delete_branch" "$subject" "$body_file"; rc=$? ;;  # see NOTE above
+  esac
+  if [ $rc -ne 0 ]; then
+    return $rc
+  fi
+
+  _tracker_merge_resolve_sha "$kind" "$repo" "$pr"
   return 0
 }
 
@@ -749,6 +1927,8 @@ tracker_check_issues() {
 # ------------------------------------------------------------------------------
 tracker_clear_cache() {
   _TRACKER_KIND_CACHE=""
+  _TRACKER_ISSUE_KIND_CACHE=""
+  _TRACKER_REVIEW_KIND_CACHE=""
   _TRACKER_ID_PATTERN_CACHE=""
   _TRACKER_VIEW_TPL_CACHE=""
 }
