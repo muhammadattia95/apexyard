@@ -88,8 +88,10 @@ jobs:
           snapshot_repo=$(mktemp -d)
           trap 'rm -rf "$snapshot_repo"' EXIT
           git -C "$snapshot_repo" init -q --bare
+          # PR #1466 lives upstream. Fetch it from the public upstream repo so
+          # private and non-fork copies of apexyard can reach the snapshots.
           git -C "$snapshot_repo" fetch -q --no-tags \
-            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            "$GITHUB_SERVER_URL/me2resh/apexyard.git" \
             refs/pull/1466/head:refs/heads/reviewed-snapshots
           # Pin full 40-character SHAs for the reviewed command-scrub snapshots
           # (PR #1466). Short SHAs can become ambiguous as history grows.
